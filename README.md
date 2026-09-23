@@ -915,7 +915,7 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 ```json
 {
   "name": "zcode-tokenspeed",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "icon": "./assets/icon.png",
   ...
 }
@@ -942,6 +942,35 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 
 下面是历次全面排查中**确认并修掉**的问题。每一条都配了回归测试，
 且做过**负向验证**（把修复回退后测试会变红）—— 所以这些坑不会悄悄回来。
+
+#### 0.6.5：asar 重打包产生「布局错位」文件，导致客户端打不开（严重）
+
+`0.6.5` 合并了社区贡献的[思考强度滑条重写](skills/zcode-tokenspeed/SKILL.md)
+（分段轨道 → dsh-reasoning-effort 同款连续拖动条）。合并前的排查里，**撞上了一次真实的
+客户端彻底打不开事故**，根因在注入器本身，一并修掉：
+
+| # | 问题 | 症状 | 修复 |
+|---|---|---|---|
+| 1 | **`_repack_asar` 回读校验只覆盖「本次被覆盖」的条目** | 重打包会整体重排数据区。一旦数据区排布与 header 声明**错位 K 字节**（看护与手动流程并发写同一 asar 时最典型），**未改动条目**不会报错、也不会被校验——它们的内容被搬到错误位置，`integrity` 却仍记着旧哈希，于是 **4,138 个条目的 integrity 与实际内容不符**。asar 结构自洽（offset 连续、零重叠、零越界）、注入脚本语法全对、日志全绿，但 Electron 按 integrity **拒绝加载**这些模块 → 主进程依赖链断裂 → **启动后静默退出、无任何日志**（`--enable-logging` 也抓不到） | 回读校验扩成**全域 integrity 自洽**：逐条重算 sha256 与记录比对，任一条不符即抛错拒绝落盘（分块读，27k 条目约 1-2s） |
+| 2 | **`_repack_asar` 无并发保护** | 看护（退出后写入）与手动 `--all` / 流水线可能**同时**对同一个 `app.asar` 读 header、算 offset、交错落盘 → 直接产出上述错位文件。这是事故的直接成因 | 新增 `_AsarWriteLock`：进程内 `threading.Lock` + 跨进程文件锁（Windows `msvcrt.locking`，锁文件 `<asar>.zp-lock`）双层互斥，全程覆盖「读 header → 排布 → 写数据 → 原子替换」；拿不到锁则轮询等待，超时报可读错误 |
+
+> **教训**：**「结构自洽」不等于「内容自洽」。** 事故当天用「条目数 + offset 连续 + 零重叠 +
+> 零越界」四件套检查过，全部通过，于是把 asar 排除在嫌疑之外，转而怀疑 Electron 更新、
+> 环境变量、崩溃日志……绕了一大圈。真正一击命中的判据是**逐条 integrity 比对**：
+> 4,138 个失配条目，且首个失配条目恰好就是注入点之后的那一个 —— 一眼看出「数据区按新尺寸、
+> header 按旧尺寸」。
+>
+> 另外两条经验：**① 回读校验必须覆盖「全部条目」而不是「本次改动」，** 否则校验本身会成为
+> 盲区；**② 报错要带足够信息。** 修复后的异常直接给出「声明 offset / size + 该处内容哈希与
+> 记录不一致 + 拒绝落盘」，把「哪个条目错了」变成一眼可见。
+>
+> 排查工具留在 `.workbuddy-ai/tmp/find_integrity_mismatch.py`（全域 integrity 体检），
+> 任何时候怀疑 asar 不干净都可以直接跑。
+>
+> 回归测试：`tests/test_patcher.py::TestAsarRepack` 的
+> `test_repack_leaves_every_entry_integrity_consistent`（正向不变量）+
+> `test_repack_refuses_to_write_misaligned_layout`（拦截面）+
+> `test_repack_is_serialized_by_write_lock` / `test_write_lock_times_out_with_actionable_message`（锁）。
 
 #### 0.6.4：外部贡献 PR「热配置」的优先级失效 + 档位不上报
 

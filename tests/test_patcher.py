@@ -221,6 +221,107 @@ class TestAsarRepack(TempCase):
         self.assertEqual(len(raw) - data_start, total)
         self.assertEqual(read_entry(self.asar, "out/renderer/assets/a.js"), before)
 
+    def test_repack_leaves_every_entry_integrity_consistent(self):
+        """★ 全域 integrity 自洽（2026-09-23 事故回归）。
+
+        重打包会整体位移数据区，**未改动条目**的 integrity 必须仍然对得上自己的
+        新位置。事故当天旧实现只回读校验了「本次被覆盖」的条目，导致 4,138 个
+        未改动条目内容错位而 integrity 未同步；asar 结构校验（offset 连续/无重叠）
+        完全看不出来，只有 Electron 按 integrity 拒绝加载时才暴露，表现为
+        「客户端打不开、无任何日志」。这里对**每一个**条目重算哈希。"""
+        zp._repack_asar(self.asar, {
+            "out/renderer/index.html": b"<html>bigger content than before</html>",
+            "out/main/index.js": b"require('electron');" + b"/* pad */" * 40,
+        }, set())
+        raw, header, data_start = zp._asar_header_raw(self.asar)
+        checked = 0
+        for p, ent in zp._asar_walk_entries(header):
+            itg = ent.get("integrity")
+            if not itg:
+                continue
+            data = zp._asar_entry_bytes(raw, data_start, ent)
+            self.assertEqual(itg["hash"], zp._sha256(data),
+                             f"{p} 重打包后 integrity 与实际内容不符（布局错位）")
+            checked += 1
+        self.assertGreater(checked, 3, "夹具条目太少，校验没有意义")
+
+    def test_repack_refuses_to_write_misaligned_layout(self):
+        """★ 布局错位的 asar 必须拒绝落盘（同上事故的拦截面）。
+
+        构造一个 header 里 offset 被写错的 asar（内容与声明不符），
+        `_repack_asar` 必须在回读校验阶段抛错、**不改动原文件**。"""
+        build_asar(self.asar, {
+            "a.js": b"A" * 100,
+            "b.js": b"B" * 200,
+            "c.js": b"C" * 300,
+        })
+        # 手工把 c.js 的 offset 改错 50 字节，integrity 保持原样（= 错位态）
+        raw, header, data_start = zp._asar_header_raw(self.asar)
+        header["files"]["c.js"]["offset"] = str(int(header["files"]["c.js"]["offset"]) - 50)
+        json_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        pad = (4 - len(json_bytes) % 4) % 4
+        blob = struct.pack("<4I", 4, 8 + len(json_bytes) + pad,
+                           4 + len(json_bytes) + pad, len(json_bytes)) + json_bytes + b"\x00" * pad
+        with open(self.asar, "r+b") as f:
+            f.write(blob)
+        before_bytes = self.asar.read_bytes()
+
+        with self.assertRaises(ValueError) as cm:
+            zp._repack_asar(self.asar, {"a.js": b"A" * 120}, set())
+        self.assertIn("integrity", str(cm.exception))
+        self.assertEqual(self.asar.read_bytes(), before_bytes,
+                         "校验失败时不应改动原文件")
+
+    def test_repack_is_serialized_by_write_lock(self):
+        """★ 同一 asar 的重打包必须互斥（2026-09-23 事故根因之一）。
+
+        看护与手动流程同时进入 `_repack_asar` 会交错落盘、产出错位文件。
+        这里用线程模拟「另一个写入者占着锁」，验证第二个进入者会等待而不是并发。"""
+        import threading
+
+        order = []
+        started = threading.Event()
+
+        def holder():
+            with zp._AsarWriteLock(self.asar, timeout=10):
+                order.append("hold-start")
+                started.set()
+                time.sleep(0.6)
+                order.append("hold-end")
+
+        t = threading.Thread(target=holder)
+        t.start()
+        started.wait(5)
+        assert order == ["hold-start"], f"锁没被持有: {order}"
+
+        # 主线程此时进入 → 必须等到 holder 释放
+        with zp._AsarWriteLock(self.asar, timeout=10):
+            order.append("second-acquired")
+        t.join(5)
+
+        self.assertEqual(order, ["hold-start", "hold-end", "second-acquired"],
+                         "两个写入者交错了（锁未生效）")
+
+    def test_write_lock_times_out_with_actionable_message(self):
+        """拿不到锁时要在有限时间内报错，而不是永久挂死。"""
+        import threading
+
+        started = threading.Event()
+
+        def holder():
+            with zp._AsarWriteLock(self.asar, timeout=10):
+                started.set()
+                time.sleep(1.5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        started.wait(5)
+        with self.assertRaises(TimeoutError) as cm:
+            with zp._AsarWriteLock(self.asar, timeout=0.4, poll=0.05):
+                pass
+        self.assertIn("写入锁超时", str(cm.exception))
+        t.join(5)
+
 
 class TestIntegritySync(TempCase):
     """integrity 同步必须只动目标条目——同内容条目不能被误伤。"""

@@ -119,6 +119,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1715,12 +1716,123 @@ def _replace_with_retry(tmp: Path, dst: Path, attempts: int = 5) -> None:
             delay = min(delay * 2, 4.0)
 
 
+class _AsarWriteLock:
+    """跨进程 + 跨线程互斥锁：保护对同一个 asar 的「读 header → 排布 → 写数据 → 原子替换」全程。
+
+    ★ 为什么必须有（2026-09-23 事故）：看护（apply_after_exit）与手动 / 流水线可能
+      同时对同一个 app.asar 调 `_repack_asar`。两个进程各自读到一份 header、各自算
+      offset，交错落盘后就会产出「数据区按 A 的布局、header 按 B 的布局」的错位文件 ——
+      表现为 offset 整体偏移固定字节数、integrity 全部失配，Electron 静默拒绝加载。
+      回读校验（integrity 全域比对）能拦住落盘，但更根本的是**从一开始就不让两个写入者
+      同时进入**，否则用户只会看到「打补丁失败」而不知原因。
+
+    两层保护，缺一不可：
+      ① 进程内 threading.Lock —— msvcrt/fcntl 的 advisory lock 是**按进程**持有的，
+         同一进程内的两个线程都能拿到，必须自己再串一层（`--all` 若改为并行就会踩）。
+      ② 跨进程文件锁 —— 锁文件放 asar 同目录（`<asar>.zp-lock`），
+         Windows msvcrt.locking / POSIX fcntl.flock。拿不到就轮询等待，超时抛 TimeoutError
+         由上层「被占用」分支处理。锁文件不删（避免 unlink 竞态），内容记持有者 pid + 时间戳。
+    """
+
+    # 同一 asar 路径 → 进程内锁（key 用规范化的绝对路径，避免相对/绝对各持一把）
+    _thread_locks: dict[str, "threading.Lock"] = {}
+    _thread_locks_guard = threading.Lock()
+
+    def __init__(self, asar: Path, timeout: float = 60.0, poll: float = 0.2):
+        self.path = asar.with_name(asar.name + ".zp-lock")
+        self.timeout = timeout
+        self.poll = poll
+        self._key = os.path.abspath(str(asar))
+        self._fh = None
+        self._tlock = None
+
+    @classmethod
+    def _thread_lock(cls, key: str) -> "threading.Lock":
+        with cls._thread_locks_guard:
+            lk = cls._thread_locks.get(key)
+            if lk is None:
+                lk = threading.Lock()
+                cls._thread_locks[key] = lk
+            return lk
+
+    def __enter__(self):
+        # ① 先拿进程内锁（带超时，避免永久阻塞）
+        self._tlock = self._thread_lock(self._key)
+        if not self._tlock.acquire(timeout=self.timeout):
+            raise TimeoutError(
+                f"等待 asar 写入锁超时（{self.timeout:.0f}s）：{self.path.name}\n"
+                f"    本进程内已有注入流程正在写入，请稍后重试")
+        # ② 再拿跨进程文件锁
+        try:
+            import msvcrt  # Windows 专用；本工具只在 Windows 注入客户端
+            deadline = time.time() + self.timeout
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            while True:
+                try:
+                    fh = open(self.path, "a+b")
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        fh.close()
+                        raise
+                    self._fh = fh
+                    try:
+                        fh.seek(0)
+                        fh.truncate()
+                        fh.write(f"{os.getpid()} {time.strftime('%Y-%m-%d %H:%M:%S')}".encode())
+                        fh.flush()
+                    except OSError:
+                        pass
+                    return self
+                except OSError:
+                    if time.time() >= deadline:
+                        raise TimeoutError(
+                            f"等待 asar 写入锁超时（{self.timeout:.0f}s）：{self.path.name}\n"
+                            f"    可能另一个注入流程（看护 / 流水线）正在写入，请稍后重试")
+                    time.sleep(self.poll)
+        except BaseException:
+            self._release_thread()
+            raise
+
+    def _release_thread(self):
+        if self._tlock is not None:
+            try:
+                self._tlock.release()
+            except RuntimeError:
+                pass
+            self._tlock = None
+
+    def __exit__(self, *exc):
+        if self._fh is not None:
+            try:
+                import msvcrt
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        self._release_thread()
+        return False
+
+
 def _repack_asar(asar: Path, overwrite: dict[str, bytes], remove: set[str]) -> int:
     """通用 asar 重打包：树中删除 remove 条目，overwrite 覆盖/新增文件数据并重算 integrity，
     全部条目 offset 重排；写临时文件、回读校验后原子替换。返回新文件大小。
 
     内存策略：**不把整包读进内存**——未改动条目从源文件按块流式搬运（asar 常达数百 MB，
-    原先 read_bytes() 会让峰值内存接近 2× 包体），只有被覆盖的条目在内存里。"""
+    原先 read_bytes() 会让峰值内存接近 2× 包体），只有被覆盖的条目在内存里。
+
+    并发：全程持有 `_AsarWriteLock`，防止看护与手动/流水线流程交错写入造成布局错位。"""
+    with _AsarWriteLock(asar):
+        return _repack_asar_locked(asar, overwrite, remove)
+
+
+def _repack_asar_locked(asar: Path, overwrite: dict[str, bytes], remove: set[str]) -> int:
+    """`_repack_asar` 的加锁实现体（持锁调用，不要直接调用）。"""
     header, data_start = _read_asar_header(asar)
 
     # overwrite 中树里尚不存在的路径（新增文件）按层级插入占位条目
@@ -1817,6 +1929,38 @@ def _repack_asar(asar: Path, overwrite: dict[str, bytes], remove: set[str]) -> i
                 f.seek(v_start + int(ent["offset"]))
                 if f.read(len(want)) != want:
                     raise ValueError(f"重打包校验失败（内容不符）: {p}")
+
+            # ★ 全域 integrity 自洽校验（2026-09-23 事故后补）：
+            #   上面只比对「本次被覆盖」的条目，一旦数据区排布与 header 声明错位
+            #   （并发写入 / 中途被打断 / 布局基准取错），**未改动条目**会静默损坏——
+            #   它们的内容被搬到偏移 K 字节处，integrity 却还记着旧内容的哈希。
+            #   后果极隐蔽：asar 结构自洽（offset/size 连续无重叠）、注入条目语法正确，
+            #   但 Electron 加载时按 integrity 校验会**拒绝加载** 4 千多个模块 →
+            #   主进程依赖链断裂 → **启动后静默退出、无任何日志**（2026-09-23 实测）。
+            #   因此这里必须逐条重算哈希：内容对的条目哈希必然对得上，
+            #   只要有一条对不上就说明布局错位，宁可失败也不落盘。
+            #
+            #   性能：27k 条目 / 320MB 全量哈希约 1-2s，相对整次重打包（含 320MB 搬运）
+            #   可忽略；分块读避免大条目整条进内存（单条最大约 8MB）。
+            for p, ent in _asar_walk_entries(v_header):
+                itg = ent.get("integrity")
+                if not itg:
+                    continue
+                size = int(ent["size"])
+                f.seek(v_start + int(ent["offset"]))
+                left = size
+                digest = hashlib.sha256()
+                while left > 0:
+                    chunk = f.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ValueError(f"重打包校验失败（integrity 读不足）: {p}")
+                    digest.update(chunk)
+                    left -= len(chunk)
+                if digest.hexdigest() != itg.get("hash"):
+                    raise ValueError(
+                        f"重打包校验失败（integrity 与实际内容不符，疑似布局错位）: {p}"
+                        f"\n    声明 offset={ent['offset']} size={size}，"
+                        f"该处内容哈希与 integrity 记录不一致 —— 拒绝落盘")
         _replace_with_retry(tmp, asar)
     except BaseException:
         tmp.unlink(missing_ok=True)   # 失败/被占用都不留临时文件残留
