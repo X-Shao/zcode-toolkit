@@ -1255,6 +1255,23 @@ class TestZcodeRunningPosix(unittest.TestCase):
         self.assertFalse(gone)
 
 
+class TestApplyAfterExitPathGuard(unittest.TestCase):
+    """apply_after_exit 的看护轮询每 3s 调一次 zcode_running()（最长 24h）。
+
+    曾经的写法是每次 sys.path.insert(0, HERE)——列表无界增长（24h 约 2.9 万个
+    重复项）。_import_patcher 必须只在缺失时插入；同时不得破坏 import 缓存。
+    """
+
+    def test_repeated_imports_do_not_grow_sys_path(self):
+        import apply_after_exit as aae
+        zp = aae._import_patcher()
+        self.assertIs(zp, sys.modules["zcode_patcher"], "应当复用缓存的模块对象")
+        baseline = len(sys.path)
+        for _ in range(200):                 # 模拟 10 分钟轮询量级的调用
+            aae._import_patcher()
+        self.assertEqual(len(sys.path), baseline, "sys.path 无界增长")
+
+
 class TestNoConsoleWindowFlags(unittest.TestCase):
     """每个会起 console 子进程的调用都必须带「别弹控制台窗口」的标志。
 

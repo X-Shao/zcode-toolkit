@@ -37,6 +37,18 @@ TASKLIST_TIMEOUT = 30
 PATCH_TIMEOUT = 600
 
 
+def _import_patcher():
+    """导入主脚本模块；sys.path 只在缺失时插入。
+
+    看护轮询循环每 POLL_SEC 秒调一次 zcode_running() → 本函数被反复执行，
+    不能每次都 insert（sys.path 会无界增长——24h 上限约 2.9 万个重复项）。
+    """
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import zcode_patcher as zp
+    return zp
+
+
 def log(msg: str) -> None:
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
@@ -51,9 +63,7 @@ def zcode_running() -> bool:
     # 轮询就崩溃；启动方又把 stderr 定向到 DEVNULL，崩溃完全无声，表现为
     # 「等退出 0 次、完成 0 次」、补丁永远写不进去。
     try:
-        sys.path.insert(0, str(HERE))
-        import zcode_patcher as zp
-        return zp.zcode_running()
+        return _import_patcher().zcode_running()
     except Exception as e:
         log(f"运行检测失败: {type(e).__name__}: {e}，本轮按「仍在运行」处理")
         return True
@@ -76,8 +86,7 @@ def _find_exe(res: Path) -> Path | None:
 def resolve_install() -> tuple[Path | None, Path | None]:
     """复用主脚本的跨平台探测拿到 (asar 目录, ZCode 可执行文件)。"""
     try:
-        sys.path.insert(0, str(HERE))
-        import zcode_patcher as zp
+        zp = _import_patcher()
         for cjs in zp.discover():
             res = cjs.parent.parent
             if (res / "app.asar").is_file():
