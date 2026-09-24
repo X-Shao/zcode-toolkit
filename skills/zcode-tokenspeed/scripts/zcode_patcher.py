@@ -2723,6 +2723,37 @@ def _resolve_asars(target: str | None) -> list[Path]:
     return asars
 
 
+def _pid_commandline(pid: str) -> "str | None":
+    """POSIX：返回进程完整命令行；进程已消失/查询失败返回 None。"""
+    try:
+        r = subprocess.run(["ps", "-o", "command=", "-p", pid],
+                           capture_output=True, timeout=5, **no_window_kwargs())
+        if r.returncode != 0:
+            return None
+        return r.stdout.decode(errors="replace").strip()
+    except Exception:
+        return None
+
+
+def _pgrep_hits_are_alive(pids: "list[str]", cmdline_of=None) -> bool:
+    """对 pgrep -f ZCode 命中的 PID 逐个核对命令行，排除 crashpad 后判应用是否存活。
+
+    ★ 为什么必须逐个核对（2026-09-24 macOS 实测）：ZCode 每次退出都会泄漏一个
+    chrome_crashpad_handler（ppid=1 的崩溃报告进程，命令行仍含 ZCode.app 路径），
+    pgrep -f ZCode 因此永远非零——退出后看护等不到「退出」，重打包级补丁永远写不
+    进去。本机曾堆积 3.9.1 / 3.10.1 时代的多个泄漏进程，应用本体早已不在。应用真正
+    存活时主进程 / ZCode Helper 必然在列且非 crashpad，不受此排除影响。
+    cmdline_of 返回 None（进程在 pgrep 与 ps 之间消失）按已退出处理。
+    """
+    cmdline_of = cmdline_of or _pid_commandline
+    for pid in pids:
+        cmd = cmdline_of(pid)
+        if cmd is None or "chrome_crashpad_handler" in cmd:
+            continue          # 已消失的 / crashpad 僵尸：不代表应用存活
+        return True
+    return False
+
+
 def zcode_running() -> bool:
     """ZCode 是否在运行（打补丁前预检：运行中会锁住 app.asar，配置也可能被回写覆盖）。"""
     try:
@@ -2732,7 +2763,10 @@ def zcode_running() -> bool:
                                  **no_window_kwargs()).stdout or b""
             return b"ZCode.exe" in out
         r = subprocess.run(["pgrep", "-f", "ZCode"], capture_output=True, timeout=10)  # no-window-ok: 只在 POSIX 分支执行
-        return r.returncode == 0
+        if r.returncode != 0:
+            return False
+        pids = r.stdout.decode(errors="replace").split()
+        return _pgrep_hits_are_alive(pids)
     except Exception:
         return False
 

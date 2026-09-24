@@ -1174,6 +1174,87 @@ class TestProcessProbeDecodesSafely(unittest.TestCase):
         self.assertEqual(found, [])
 
 
+@unittest.skipIf(os.name == "nt", "POSIX 分支（Windows 走 tasklist，不经过这段）")
+class TestZcodeRunningPosix(unittest.TestCase):
+    """zcode_running 的 POSIX 分支：泄漏的 crashpad 僵尸必须被排除。
+
+    macOS 实测（2026-09-24）：ZCode 每次退出都泄漏一个 chrome_crashpad_handler
+    （ppid=1、命令行含 ZCode.app 路径），pgrep -f ZCode 永远非零，退出后看护
+    等不到「退出」、重打包级补丁永远写不进去——曾堆积 3.9.1/3.10.1 时代的进程。
+    """
+
+    CRASHPAD = ("/Applications/ZCode.app/Contents/Frameworks/Electron Framework.framework"
+                "/Helpers/chrome_crashpad_handler --annotation=_productName=ZCode")
+    HELPER = ("/Applications/ZCode.app/Contents/Frameworks/ZCode Helper.app/Contents"
+              "/MacOS/ZCode Helper --type=gpu-process")
+
+    def setUp(self):
+        import zcode_patcher as zp
+        self.zp = zp
+        self._orig_run = zp.subprocess.run
+
+    def tearDown(self):
+        self.zp.subprocess.run = self._orig_run
+
+    def _install_fake(self, pgrep_rc, pgrep_out, cmdlines):
+        """cmdlines: pid(str) -> 命令行字符串；None 表示 ps 查不到（进程已消失）。"""
+        class _R:
+            def __init__(self, rc, out):
+                self.returncode = rc
+                self.stdout = out
+
+        def fake_run(args, **kw):
+            if args[0] == "pgrep":
+                return _R(pgrep_rc, pgrep_out)
+            cmd = cmdlines.get(args[-1], "")
+            return _R(0 if cmd is not None else 1, (cmd or "").encode())
+
+        self.zp.subprocess.run = fake_run
+
+    def test_no_hits_means_not_running(self):
+        self._install_fake(1, b"", {})
+        self.assertFalse(self.zp.zcode_running())
+
+    def test_only_crashpad_zombies_means_not_running(self):
+        """应用已退出、只剩泄漏的 crashpad（跨版本堆积）——必须判「未运行」。"""
+        self._install_fake(0, b"111 222 333\n", {
+            "111": self.CRASHPAD + " --version=3.14.3",
+            "222": self.CRASHPAD + " --version=3.10.1",
+            "333": self.CRASHPAD + " --version=3.9.1",
+        })
+        self.assertFalse(self.zp.zcode_running())
+
+    def test_crashpad_plus_real_helper_means_running(self):
+        """crashpad 泄漏与真实 helper 并存——必须判「在运行」（crashpad 不影响判定）。"""
+        self._install_fake(0, b"111 222\n", {"111": self.HELPER, "222": self.CRASHPAD})
+        self.assertTrue(self.zp.zcode_running())
+
+    def test_vanished_pid_counts_as_gone(self):
+        """pgrep 命中后进程在 ps 之前消失：按已退出处理，不得抛错或误判存活。"""
+        self._install_fake(0, b"111\n", {"111": None})
+        self.assertFalse(self.zp.zcode_running())
+
+    def test_pid_commandline_reads_real_process(self):
+        """_pid_commandline 对真实子进程可用（ps 集成，非 mock）。"""
+        p = subprocess.Popen(["sleep", "5"])
+        try:
+            cmd = self.zp._pid_commandline(str(p.pid))
+            self.assertIsNotNone(cmd)
+            self.assertIn("sleep", cmd)
+        finally:
+            p.terminate()
+            p.wait()
+
+    def test_hits_are_alive_with_injected_cmdline(self):
+        """纯函数入口：真实 cmdline_of 回调 + crashpad/真进程混合。"""
+        alive = self.zp._pgrep_hits_are_alive(
+            ["1", "2"], cmdline_of=lambda pid: self.CRASHPAD if pid == "1" else self.HELPER)
+        self.assertTrue(alive)
+        gone = self.zp._pgrep_hits_are_alive(
+            ["1"], cmdline_of=lambda pid: self.CRASHPAD)
+        self.assertFalse(gone)
+
+
 class TestNoConsoleWindowFlags(unittest.TestCase):
     """每个会起 console 子进程的调用都必须带「别弹控制台窗口」的标志。
 
