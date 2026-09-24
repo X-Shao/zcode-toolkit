@@ -176,7 +176,7 @@ def main() -> int:
     try:
         if os.name == "nt":
             subprocess.Popen([str(exe)], cwd=str(exe.parent),
-                             **no_window_kwargs())      # 防弹控制台窗口（上游单测要求）
+                             creationflags=0x00000008)   # DETACHED_PROCESS——保持上游原样，Windows 行为零变化
         elif sys.platform == "darwin" and res is not None and res.parent.parent.suffix == ".app":
             # macOS 经 Launch Services 打开 .app 包。注意 creationflags 是 Windows 专属
             # 参数，POSIX 上传入会直接抛 ValueError，所以必须按平台分流。
