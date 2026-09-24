@@ -915,7 +915,7 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 ```json
 {
   "name": "zcode-tokenspeed",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "icon": "./assets/icon.png",
   ...
 }
@@ -942,6 +942,44 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 
 下面是历次全面排查中**确认并修掉**的问题。每一条都配了回归测试，
 且做过**负向验证**（把修复回退后测试会变红）—— 所以这些坑不会悄悄回来。
+
+#### 0.6.6：润色图标在「输入框为空 / 会话进行中」跑到输入框左上角
+
+**症状**：输入框工具栏里的润色图标不在右侧，而是贴在**输入框左上角**；正常对话（有内容、未生成）时位置是对的。
+
+**根因**：挂载点解析的**兜底链会落到「输入框的祖先」上**，而 `insertBefore(host, host.firstChild)`
+恰好就是那个容器的左上角。三个叠加因素：
+
+1. 兜底第一档 `[data-testid*='composer-toolbar']` 是**死选择器**——3.14.3 的 asar 里命中数为 **0**
+   （工具栏行只有 class，没有 testid），于是必然落到下一档；
+2. 下一档 `[data-testid='v4-composer']` 就是**卡片本身**（输入框所在区域，是输入框的祖先）→ 左上角；
+3. **发送按钮不是恒定锚点**：内核里提交控件是 `sn = canStop && !hasContent ? 停止按钮 : 发送按钮`，
+   所以「输入框为空 + 会话进行中」时 `v4-composer-send` 被 `v4-stop` **替换**，`querySelector` 返回 null
+   → 触发兜底 → 左上角。这也解释了为什么它看起来像偶发：输入框为空但**未**生成时，
+   发送按钮只是 `disabled`，仍在 DOM 里，那一刻位置是对的。
+
+**修复**：挂载点改成三级解析，任何一级都**不退回卡片 / dock 本体**：
+右侧操作区 `[data-composer-trailing-actions]`（跨状态恒存在，prepend）→
+发送/停止按钮的父节点（prepend）→ 工具栏行（**append 贴行尾**，绝不插行首）。
+全解析失败则**保持原位不搬迁**（旧行为是搬到左上角）。
+
+| 文件 | 修改 |
+|---|---|
+| `scripts/zcode-enhance-prompt.js` | 新增 `findCard()` / `findToolbarRow()` / `findMount()` / `place()`；`ensureButton()` 改用三级解析；删掉死选择器与「越界回退 dock」兜底；`diag` 新增 `mountWhere`，`scriptVersion` 1.3 → 1.4 |
+| `tests/enhance_mount_smoke.js` | **新增**：最小 DOM 桩复刻真实 composer 结构，真跑 6 个状态（待机 / 输入框为空 / **发送按钮被停止按钮替换** / 锚点全缺失 / 连操作区都没有 / 自愈 + 幂等），断言按钮始终在右侧操作区、绝不当卡片首子节点 |
+
+> **教训**：**「取不到首选锚点」时的兜底，不能退到语义更宽的元素上。**
+> 这里首选锚点是「发送按钮」，而兜底退到了「卡片 / dock」——它们不是「稍差的位置」，
+> 而是**输入框的祖先**，往其 `firstChild` 插入就等价于左上角。兜底必须退到**同一语义层级**
+> （另一个按钮 → 同一操作区 → 同级的工具栏行），或者干脆**不动**。
+>
+> 另一个可复用的点：**锚点会不会消失，要去内核里查条件，不能靠「我见过它在」。**
+> 发送按钮的消失条件写在提交控件的三目里（`sn = canStop && !hasContent`），
+> 读一眼就知道「输入框为空 + 生成中」必然踩中；靠观察只能得出"偶发"。
+
+回归测试：`tests/enhance_mount_smoke.js` + `tests/test_patcher.py::TestEnhancePromptScript`
+（源码级不变量：不得出现 `host = dock;`、必须同时认 `v4-composer-send` 与 `v4-stop`）。
+**负向验证**：把脚本回退到修复前，冒烟测试立刻红在「会话进行中 → `CARD(top-left!)`」。
 
 #### 0.6.5：asar 重打包产生「布局错位」文件，导致客户端打不开（严重）
 

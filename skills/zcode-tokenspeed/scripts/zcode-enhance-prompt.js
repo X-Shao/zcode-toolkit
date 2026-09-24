@@ -15,6 +15,14 @@
  *
  * 安全：只读输入框内容、只写输入框与自己的按钮；不额外发网络请求（请求在主进程侧发起）；
  *      异常静默，找不到输入框时自清理。诊断：window.__zenhanceDiag
+ *
+ * ★ 挂载点（1.4 修复「图标跑到输入框左上角」）：
+ *   图标必须落在工具栏**右侧操作区**（与发送按钮同一组）。旧实现拿「发送按钮的父节点」当
+ *   唯一锚点，取不到就退回**卡片 / dock 本体的 firstChild** —— 那两处都是输入框的祖先，
+ *   等价于把图标钉在输入框左上角。而发送按钮并非恒定存在：输入框为空 + 会话进行中时，
+ *   内核用「停止按钮」替换它（`sn = canStop && !hasContent`），于是图标就跑到左上角。
+ *   现在改为「右侧操作区 → 发送/停止按钮父节点 → 工具栏行（贴行尾）」三级解析，
+ *   任何一级都**不会**退到卡片 / dock 本体；全解析失败就保持原位、不动。
  */
 (() => {
   if (window.__zenhance) return;
@@ -24,7 +32,7 @@
   const BTN_ID = "zcode-enhance-prompt-btn";
   const STYLE_ID = "zenhance-style";
   const diag = (window.__zenhanceDiag = window.__zenhanceDiag || {});
-  diag.scriptVersion = "1.3";
+  diag.scriptVersion = "1.4";
 
   const TIP_IDLE = "增强提示词";
   const TIP_BUSY = "增强中…";
@@ -220,6 +228,94 @@
     return { value, label };
   }
 
+  // ---------- 挂载点解析 ----------
+  // 客户端 composer 工具栏的真实结构（3.14.3，out/renderer 实证）：
+  //
+  //   div[data-testid='v4-composer']                ← 卡片 = 输入框所在区域(.chat-composer-region)
+  //    └─ div.chat-composer-input-surface
+  //       └─ div.group/toolbar.flex.items-end.gap-3 ← 工具栏行
+  //          ├─ div[data-composer-leading-actions]      ← 左侧（+ / 附件）
+  //          └─ div[data-composer-trailing-actions]     ← ★ 右侧操作区（恒存在）
+  //             └─ div.flex.min-w-0.items-center.gap-1  ← 提交控件容器
+  //                ├─ span …                              ← 模型胶囊
+  //                └─ button[data-testid='v4-composer-send'] ← 发送
+  //
+  // ★ 发送按钮不是恒定锚点：**输入框为空 + 会话进行中**时，内核用
+  //   button[data-testid='v4-stop']（停止）替换它（sn = canStop && !hasContent）。
+  //   旧实现只认 v4-composer-send，取不到就退回卡片/dock 的 firstChild —— 那正是
+  //   输入框左上角，于是「输入框为空」和「会话进行中」两种情况下图标都会跑到左上角。
+  const CARD_SELECTOR = "[data-testid='v4-composer']";
+  const TRAILING_SELECTOR = "[data-composer-trailing-actions]";
+  const ANCHOR_BUTTON_SELECTORS = [
+    "[data-testid='v4-composer-send']",
+    "[data-testid='v4-stop']",
+  ];
+
+  /** 输入框所在的 composer 卡片（.chat-composer-region）；找不到才退回 dock。 */
+  function findCard(input, dock) {
+    let card = null;
+    try { card = input && input.closest(CARD_SELECTOR); } catch (err) { /* ignore */ }
+    if (!card && dock) {
+      try { card = dock.querySelector(CARD_SELECTOR); } catch (err) { /* ignore */ }
+    }
+    return card || dock || null;
+  }
+
+  /** 工具栏行：class 同时含 flex 与 items-end 的 div（与 TPS 状态栏同一套结构判定，
+   *  不依赖任何会随版本/语言变化的文案）。 */
+  function findToolbarRow(card) {
+    if (!card) return null;
+    let rows = [];
+    try {
+      rows = Array.from(card.querySelectorAll("div")).filter((el) => {
+        const c = typeof el.className === "string" ? el.className : "";
+        return /(^|\s)flex(\s|$)/.test(c) && /items-end/.test(c);
+      });
+    } catch (err) { /* ignore */ }
+    if (!rows.length) return null;
+    return rows.find((el) => el.querySelector("button,select,[role='combobox'],input"))
+        || rows[rows.length - 1];
+  }
+
+  /** 解析挂载点，返回 { host, where }：where = "prepend"（右侧操作区，与发送按钮同组）
+   *  或 "append"（兜底工具栏行，贴行尾）。host 为 null = 解析失败。
+   *  ★ 任何一级都**不得**退到卡片 / dock 本体：它们是输入框的祖先，往其 firstChild
+   *    插入就等于把图标钉在输入框左上角（本次要修的 bug）。 */
+  function findMount(input, dock) {
+    const card = findCard(input, dock);
+    // ① 首选：右侧操作区 —— 唯一跨状态恒存在的锚点（发送/停止按钮都在它内部）
+    let host = null;
+    if (card) {
+      try { host = card.querySelector(TRAILING_SELECTOR); } catch (err) { /* ignore */ }
+    }
+    if (host) return { host, where: "prepend" };
+    // ② 次选：发送 / 停止按钮的父节点（两者同属一个提交控件容器）。
+    //    先在 card 内查，避免多会话/多 composer 时抓到别的卡片的按钮。
+    for (const sel of ANCHOR_BUTTON_SELECTORS) {
+      let el = null;
+      if (card) {
+        try { el = card.querySelector(sel); } catch (err) { /* ignore */ }
+      }
+      if (!el) {
+        try { el = document.querySelector(sel); } catch (err) { /* ignore */ }
+      }
+      if (el && el.parentElement && (!card || card.contains(el))) {
+        return { host: el.parentElement, where: "prepend" };
+      }
+    }
+    // ③ 末选：工具栏行 —— 追加到**行尾**（右端），绝不插行首（= 输入框左侧/左上角）
+    const row = findToolbarRow(card);
+    if (row) return { host: row, where: "append" };
+    return { host: null, where: null };
+  }
+
+  /** 落位：prepend = 图标落在模型胶囊/发送按钮**左侧**（即既有正确位置）；
+   *  append 仅用于兜底工具栏行。 */
+  function place(el, host, where) {
+    if (where === "append") host.appendChild(el);
+    else host.insertBefore(el, host.firstChild);
+  }
+
   // ---------- 按钮 ----------
   let btn = null;
   let busy = false;
@@ -317,33 +413,20 @@
     const input = findInput();
     if (!input) { if (btn) { btn.remove(); btn = null; } diag.hiddenReason = "未找到输入框"; return; }
 
-    // ★ 挂载点必须在 composer dock 内部，且优先与「发送按钮」同一工具栏行。
-    //   历史 bug：兜底用 input.parentElement / card.querySelector("div") 取到的是
-    //   dock 的某个祖先或无关兄弟，按钮被插到消息流里（按钮「跑出输入框」）。
+    // ★ 挂载点 = 工具栏「右侧操作区」（与发送按钮同一组），见 findMount()。
+    //   绝不再退回卡片 / dock 本体：那是输入框的祖先，往其 firstChild 插入
+    //   就等于把图标钉在输入框左上角（历史 bug：输入框为空 / 会话进行中）。
     const dock = findDock();
-    let host = null;
-    try {
-      // ① 首选：发送按钮的父节点 = 工具栏行（恒在 dock 内）
-      const send = document.querySelector("[data-testid='v4-composer-send']");
-      if (send && send.parentElement) host = send.parentElement;
-      // ② 次选：dock 内的工具栏行 / 卡片
-      if (!host && dock) {
-        host = dock.querySelector("[data-testid*='composer-toolbar']")
-            || dock.querySelector("[data-testid='v4-composer']")
-            || dock.querySelector("[data-v4-composer-dock-content]")
-            || dock;
-      }
-      // ③ 末选：输入框向上找 dock 为止（只允许爬升到 dock，不许越过）
-      if (!host && dock) {
-        let cur = input.parentElement;
-        while (cur && cur !== dock && !dock.contains(cur)) cur = cur.parentElement;
-        host = cur && dock.contains(cur) ? cur : null;
-      }
-    } catch (err) { /* ignore */ }
-
-    // 最终校验：挂载点必须在 dock 内。不在就宁可不挂，也绝不渲染到消息区。
-    if (host && dock && !dock.contains(host)) host = dock;
-    if (!host) { diag.hiddenReason = "未找到工具栏行"; return; }
+    const mount = findMount(input, dock);
+    const host = mount.host;
+    if (!host) {
+      // 解析不到操作区：保持现状，绝不搬到左上角。从未挂上过才允许下次重试。
+      diag.hiddenReason = "未找到工具栏操作区";
+      if (btn && !btn.isConnected) btn = null;
+      return;
+    }
+    diag.hiddenReason = null;
+    diag.mountWhere = mount.where;
 
     if (btn && btn.isConnected) {
       // ★ 位置自愈：按钮虽还在文档里，但已不在正确容器内（客户端重渲染把按钮
@@ -352,7 +435,7 @@
       const stillInDock = !dock || dock.contains(btn);
       if (!okPlace || !stillInDock) {
         diag.reattaches = (diag.reattaches || 0) + 1;
-        host.insertBefore(btn, host.firstChild);
+        place(btn, host, mount.where);
       }
       return;
     }
@@ -367,9 +450,8 @@
       if (btn.getAttribute("data-mode") === "revert") onRevert();
       else enhance();
     });
-    host.insertBefore(btn, host.firstChild);
+    place(btn, host, mount.where);
     setButton("idle");
-    diag.hiddenReason = null;
     diag.buttonAttached = true;
   }
 

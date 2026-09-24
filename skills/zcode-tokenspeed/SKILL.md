@@ -901,6 +901,76 @@ div[data-v4-timeline-scroll]          ← overflow-y-auto，真正的滚动宿�
 自诊断新增字段：`window.__zenhanceDiag.reattaches`（>0 说明发生过自愈搬迁，
 可用于确认线上是否仍在错位）。
 
+### ★ 已知坑：图标跑到输入框**左上角**（1.4 / 0.6.6 修复）
+
+**症状**：润色图标不在工具栏右侧，而是贴在**输入框左上角**。两个可复现的时机：
+① 输入框为空时；② 会话进行中（生成过程中）。正常对话（有内容、未生成）时位置是对的。
+
+**根因**：挂载点解析的**兜底链会落到「输入框的祖先」上**，而 `insertBefore(host, host.firstChild)`
+正好是那个容器的左上角。旧实现：
+
+```js
+// 旧（有 bug）：只认发送按钮；取不到就一路退到卡片/dock 本体
+const send = document.querySelector("[data-testid='v4-composer-send']");
+if (send && send.parentElement) host = send.parentElement;
+if (!host && dock) {
+  host = dock.querySelector("[data-testid*='composer-toolbar']")   // ← 选择器恒不命中（实测 0 个）
+      || dock.querySelector("[data-testid='v4-composer']")         // ← 卡片 = 输入框所在区域
+      || dock.querySelector("[data-v4-composer-dock-content]")
+      || dock;                                                     // ← 最坏 = 整个 dock
+}
+if (host && dock && !dock.contains(host)) host = dock;
+```
+
+三个致命点：
+
+1. **`[data-testid*='composer-toolbar']` 是死选择器**——在 3.14.3 的 asar 里命中数为 **0**
+   （工具栏行只有 class `group/toolbar flex items-end gap-3`，没有 testid），所以它永远落到下一档；
+2. **下一档 `[data-testid='v4-composer']` 就是卡片本身**，它是输入框的**祖先**；
+   `insertBefore(btn, card.firstChild)` = 图标钉在输入框左上角；
+3. **发送按钮不是恒定锚点**。内核里提交控件是
+   `sn = canStop && !hasContent ? 停止按钮 : 发送按钮`
+   （`sn = $t && !tn`，`$t = !!e?.control.canStop`，`tn` = 输入框/附件/上下文有无内容）——
+   **输入框为空 + 会话进行中**时，`[data-testid='v4-composer-send']` 被
+   `[data-testid='v4-stop']` **替换**，`querySelector` 直接返回 null → 触发上面的兜底 → 左上角。
+
+所以「输入框为空」与「会话进行中」其实是**同一个内核条件**的两种描述：生成中清空输入框，
+就同时满足两者。（输入框为空但**未**生成时发送按钮只是 `disabled`，仍在 DOM 里，
+所以那个瞬间位置是对的——这也解释了为什么它看起来像"偶发"。）
+
+**修复（1.4）**：改成三级解析，任何一级都不退回卡片 / dock 本体：
+
+| 级 | 锚点 | 落位 |
+|---|---|---|
+| ① | `card.querySelector("[data-composer-trailing-actions]")` —— 工具栏**右侧操作区**，跨状态恒存在 | prepend（图标在模型胶囊/发送按钮左侧 = 既有正确位置） |
+| ② | `[data-testid='v4-composer-send']` / `[data-testid='v4-stop']` 的父节点（两者同属一个提交控件容器） | prepend |
+| ③ | 工具栏行（class 含 `flex` + `items-end`，与 TPS 状态栏同一套结构判定） | **append**（贴行尾；绝不插行首） |
+
+解析全失败时**保持原位、不搬迁**（旧行为是搬到左上角），并在
+`window.__zenhanceDiag.hiddenReason = "未找到工具栏操作区"` 里说明。
+
+真实 DOM 结构（3.14.3 实证，也是这次定位的依据）：
+
+```
+div[data-testid='v4-composer']                  ← 卡片 = .chat-composer-region（输入框所在区域）
+ └─ div.chat-composer-input-surface
+    ├─ div[data-testid='v4-composer-input']     ← 输入框
+    └─ div.group/toolbar.flex.items-end.gap-3   ← 工具栏行（无 testid！）
+       ├─ div[data-composer-leading-actions]        ← 左侧（+ / 附件）
+       └─ div[data-composer-trailing-actions]       ← ★ 右侧操作区（恒存在）
+          └─ div.flex.min-w-0.items-center.gap-1    ← 提交控件容器
+             ├─ span …                                ← 模型胶囊
+             └─ button[data-testid='v4-composer-send']（生成中且无内容时 → 'v4-stop'）
+```
+
+自诊断新增字段：`window.__zenhanceDiag.mountWhere`（`prepend` / `append`，看走的是哪一级）。
+
+回归测试：`tests/enhance_mount_smoke.js`（最小 DOM 桩，**真跑** 6 个状态：待机 / 输入框为空 /
+**发送按钮被停止按钮替换** / 锚点全缺失 / 连操作区都没有 / 自愈 + 幂等），
+Python 侧 `tests/test_patcher.py::TestEnhancePromptScript`
+（含源码级不变量：不得出现 `host = dock;`、必须同时认 `v4-composer-send` 与 `v4-stop`）。
+负向验证：把脚本回退到修复前，冒烟测试立刻红在「会话进行中 → CARD(top-left!)」。
+
 ### 排障速查
 
 | 现象 | 处理 |
@@ -909,6 +979,7 @@ div[data-v4-timeline-scroll]          ← overflow-y-auto，真正的滚动宿�
 | ★ **更新插件 + 退出重启后仍不生效** | ★ 插件市场「更新」只换插件目录，**不重新注入 app.asar**；而 ≤0.6.0 的同步脚本看到 `--check` 输出里的「已打」就判成 `on` → 永远跳过重跑 → 旧片段永远留在 asar 里，**且不报任何错**。判定：`--enhance-prompt --check` 出现「含旧版组件」即是。**0.6.1+ 已自动识别（新 `stale` 态）**；旧版手动 `--all`。详见「插件更新≠补丁更新」 |
 | 报 `Model is unavailable` | ★ 解析没命中界面所选模型。跑 `enhance_doctor.py --model-value "<providerId>/<modelId>"` 看 `how=`；`ref` 之外都要查：① 选中供应商是否只在 `provider_config.json` 里（旧版 handler 读的是 `config.json`，见上文 0.5.10）；② 该供应商是否被 `systemDisabledReason` 禁用 |
 | 按钮跑到消息区 / 看不见 | ★ 挂载点跑出了 composer dock。升级到 **0.5.11+**；确认注入也是新版（`--dry-run`）。诊断看 `window.__zenhanceDiag.reattaches`（>0 = 发生过自愈）与 `hiddenReason` |
+| ★ **图标跑到输入框左上角**（输入框为空 / 会话进行中时） | ★ 挂载点兜底落到了「输入框的祖先」（卡片 / dock），`insertBefore(firstChild)` 正好是左上角。升级到 **0.6.6+**（脚本 `scriptVersion 1.4`）；确认注入也是新版（`--enhance-prompt --dry-run`）。诊断看 `window.__zenhanceDiag.mountWhere`（应为 `prepend`）与 `scriptVersion` |
 | 升级到 0.5.10 后仍报错 | 确认**注入**也升到了新版：`--enhance-prompt --dry-run` 看是否有「将热更新…（X → Y 字节）」。`--check` 只看挂载标记，不比对脚本内容 |
 | 报「通信桥不可用」 | preload 桥缺失；重跑 `--enhance-prompt` 注入后**重启** ZCode |
 | 按钮不出现 | `window.__zenhanceDiag.hiddenReason`；找不到输入框 / 找不到工具栏行 |

@@ -1377,9 +1377,9 @@ class TestSliderScript(unittest.TestCase):
 
 
 class TestEnhancePromptScript(unittest.TestCase):
-    """润色按钮的挂载逻辑：按钮绝不能渲染到会话消息区。
+    """润色按钮的挂载逻辑：按钮既不能渲染到会话消息区，也不能跑到输入框左上角。
 
-    历史 bug：`findInput()` 在**整个 document** 上按 `textarea` /
+    历史 bug ①：`findInput()` 在**整个 document** 上按 `textarea` /
     `[contenteditable='true']` 这类通用选择器找「交互输入框」。但客户端的会话消息区
     （`[data-v4-timeline-scroll]` 内）也会出现这类节点，一旦命中就会：
       ① 把消息区元素误认成输入框 → 读写正文全错；
@@ -1387,12 +1387,22 @@ class TestEnhancePromptScript(unittest.TestCase):
     而且输入框 dock（`[data-v4-composer-dock]`）与消息层是**同级兄弟**，
     都位于滚动容器内，dock 仅靠 `sticky bottom-0` 贴底，所以插错位置后
     会随消息增长被推到列表底部。
-
     修法：所有查找先锚定 dock；兼容模式禁用会误伤消息区的通用选择器。
+
+    历史 bug ②（1.4 修）：挂载点只认「发送按钮的父节点」，取不到就退回
+    **卡片 / dock 本体的 firstChild** —— 那两处都是输入框的祖先，等价于把图标钉在
+    输入框左上角。而发送按钮并非恒存在：内核里提交控件是
+    `sn = canStop && !hasContent ? 停止按钮 : 发送按钮`，所以「输入框为空 + 会话进行中」
+    时它被 `[data-testid='v4-stop']` 替换 → 图标跑到左上角。
+    修法：三级解析（右侧操作区 → 发送/停止按钮父节点 → 工具栏行贴行尾），
+    任何一级都不退回卡片/dock；解析失败保持原位。
+    `tests/enhance_mount_smoke.js` 用最小 DOM 桩把这几个状态真跑一遍。
     """
 
     @classmethod
     def setUpClass(cls):
+        cls.node = shutil.which("node") or shutil.which("node.exe")
+        cls.smoke = _HERE / "enhance_mount_smoke.js"
         cls.script = None
         for cand in (_HERE.parent / "scripts",
                      _HERE.parent / "skills" / "zcode-tokenspeed" / "scripts"):
@@ -1405,6 +1415,33 @@ class TestEnhancePromptScript(unittest.TestCase):
 
     def setUp(self):
         self.src = self.script.read_text(encoding="utf-8")
+
+    def _node(self, *args):
+        return subprocess.run([self.node, *args], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+
+    def test_mount_smoke_passes_in_all_composer_states(self):
+        """把「待机 / 输入框为空 / 会话进行中（发送按钮被停止按钮替换）」等
+        状态真跑一遍，按钮必须始终落在工具栏右侧操作区。"""
+        if not self.node:
+            self.skipTest("本机没有 node，跳过挂载冒烟测试")
+        if not self.smoke.is_file():
+            self.skipTest("未找到 enhance_mount_smoke.js")
+        r = self._node(str(self.smoke), str(self.script))
+        self.assertEqual(r.returncode, 0,
+                         f"挂载冒烟测试失败：{(r.stdout + r.stderr)[:600]}")
+        self.assertIn("enhance mount smoke OK", r.stdout)
+
+    def test_mount_smoke_without_argument_fails_helpfully(self):
+        """缺参数要给「用法」提示并退 2，而不是把 readFileSync 的裸堆栈甩出来。"""
+        if not self.node:
+            self.skipTest("本机没有 node，跳过挂载冒烟测试")
+        if not self.smoke.is_file():
+            self.skipTest("未找到 enhance_mount_smoke.js")
+        r = self._node(str(self.smoke))
+        self.assertEqual(r.returncode, 2, "缺参数应以退出码 2 结束（区别于测试失败）")
+        self.assertIn("用法", r.stderr + r.stdout)
+        self.assertNotIn("ERR_INVALID_ARG_TYPE", r.stderr, "不该把 Node 的裸异常甩出来")
 
     def test_scopes_input_lookup_to_composer_dock(self):
         """必须先解析 dock，再在 dock 内找输入框。"""
@@ -1432,29 +1469,61 @@ class TestEnhancePromptScript(unittest.TestCase):
         # 但整个 document 直接用它就是 bug
         self.assertIn("COMPOSER_INPUT_SELECTORS", body)
 
-    def test_host_is_validated_inside_dock(self):
-        """挂载点最终必须在 dock 内，否则宁可不挂。"""
+    def test_host_never_falls_back_to_card_or_dock(self):
+        """挂载点绝不能退回卡片 / dock 本体 —— 那是输入框的祖先。
+
+        历史 bug（0.6.6 修）：旧实现只认 `[data-testid='v4-composer-send']` 当锚点，
+        取不到就 `dock.querySelector("[data-testid='v4-composer']") || … || dock`，
+        再 `host.insertBefore(btn, host.firstChild)` —— 于是图标被钉在**输入框左上角**。
+        而发送按钮并非恒存在：输入框为空 + 会话进行中时，内核用
+        `[data-testid='v4-stop']`（停止）替换它（`sn = canStop && !hasContent`），
+        所以「输入框为空」和「会话进行中」两种情况都会复现。
+        """
         body = self.src[self.src.index("function ensureButton("):]
-        self.assertIn("dock.contains(host)", body,
-                      "挂载点必须校验在 dock 内（否则会渲染进消息区）")
-        self.assertIn("if (host && dock && !dock.contains(host)) host = dock;", body,
-                      "越界的挂载点应回退到 dock 本身")
+        body = body[:body.index("\n  function start(")]
+        # 不得再出现「越界就回退到 dock 本身」这种兜底
+        self.assertNotIn("host = dock;", body,
+                         "挂载点不得回退到 dock 本体（= 输入框左上角）")
+        self.assertNotIn("!dock.contains(host)", body,
+                         "不应再用「越界回退 dock」的旧校验")
+        # 解析失败时必须保持原位 / 不挂，而不是搬到某个大容器
+        self.assertIn("未找到工具栏操作区", body)
+        # 锚点解析集中在 findMount()，且同时覆盖发送与停止两种按钮
+        self.assertIn("'v4-composer-send'", self.src, "兜底要认发送按钮")
+        self.assertIn("'v4-stop'", self.src,
+                      "生成中发送按钮会被停止按钮替换，必须一并认作锚点")
+        mount = self.src[self.src.index("function findMount("):]
+        mount = mount[:mount.index("\n  /** 落位")]
+        self.assertIn("TRAILING_SELECTOR", mount, "首选锚点应是右侧操作区")
+        self.assertIn("ANCHOR_BUTTON_SELECTORS", mount, "二级锚点是提交控件容器")
+        self.assertIn('where: "append"', mount, "工具栏行兜底只能追加到行尾")
+        self.assertIn("appendChild", self.src, "行尾追加用 appendChild")
 
     def test_button_self_heals_when_detached_from_dock(self):
         """客户端重渲染会把按钮搬走 —— 必须能自动搬回来（且记账到 diag）。"""
         body = self.src[self.src.index("function ensureButton("):]
+        body = body[:body.index("\n  function start(")]
         self.assertIn("stillInDock", body, "需要判断按钮是否已脱离 dock")
         self.assertIn("reattaches", body, "自愈次数要记入诊断，便于线上确认")
-        # 自愈分支：先记账，再 insertBefore 搬回，最后 return（不重复创建按钮）
+        # 自愈分支：先记账，再按解析出的方式搬回，最后 return（不重复创建按钮）
         m = re.search(
             r"if \(!okPlace \|\| !stillInDock\) \{([\s\S]*?)\}", body)
         self.assertIsNotNone(m, "找不到「位置不对就搬回」的分支")
         branch = m.group(1)
         self.assertIn("reattaches", branch, "自愈分支要记账")
-        self.assertIn("host.insertBefore(btn, host.firstChild)", branch,
+        self.assertIn("place(btn, host, mount.where)", branch,
                       "自愈分支要把按钮搬回挂载点")
         # 已连接的按钮分支不得重新 createElement（否则会重复插入）
         self.assertNotIn("createElement", branch, "自愈分支不应重建按钮")
+
+    def test_place_prepends_into_right_side_action_group(self):
+        """落位规则：右侧操作区用 prepend（图标落在发送按钮左侧 = 既有正确位置），
+        只有兜底的工具栏行才 append（贴行尾）。prepend 绝不能作用在行容器上。"""
+        body = self.src[self.src.index("function place("):]
+        body = body[:body.index("\n  // ---------- 按钮 ----------")]
+        self.assertIn('where === "append"', body)
+        self.assertIn("appendChild", body)
+        self.assertIn("insertBefore(el, host.firstChild)", body)
 
     def test_no_unscoped_generic_query_remains(self):
         """全局 document 查询里不得再出现裸 textarea / contenteditable。"""
