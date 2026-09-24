@@ -567,7 +567,11 @@ class TestKernelPatch(TempCase):
         upgraded = make_cjs(zp.ANCHORS["3.9.2"], prefix="/*upgraded-kernel*/")
         self.cjs.write_bytes(upgraded)
         self.assertTrue(self.patch())
-        stale = list(self.tmp.glob("zcode.cjs.bak.stale-*"))
+        # glob 必须排除 .meta.json：_archive_backup 会把 bak 与 bak.meta.json 一起改名成
+        # stale-*，两者都命中该模式；目录枚举顺序（APFS 按名字哈希）随时间戳变化，
+        # stale[0] 取到谁是随机的——曾表现为同代码 10 跑 4~6 挂的 flaky。
+        stale = [p for p in self.tmp.glob("zcode.cjs.bak.stale-*")
+                 if not p.name.endswith(".meta.json")]
         self.assertTrue(stale, "旧备份未归档")
         meta = json.loads((self.tmp / "zcode.cjs.bak.meta.json").read_text(encoding="utf-8"))
         self.assertEqual(meta["sha256"], zp._sha256(upgraded), "备份不是升级后内核的原始副本")
