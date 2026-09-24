@@ -916,10 +916,37 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 {
   "name": "zcode-tokenspeed",
   "version": "0.6.6",
-  "icon": "./assets/icon.png",
+  "icon": "https://raw.githubusercontent.com/c80361619/zcode-toolkit/main/assets/icon.png",
   ...
 }
 ```
+
+> **⚠️ `icon` 必须是 `https://` 开头的绝对 URL —— 相对路径一定不显示图标。**
+>
+> 客户端渲染侧对图片字段做的是**纯字符串前缀判断**，不做「相对市场根解析」：
+>
+> ```js
+> function vL(e){ return typeof e === "string" && e.startsWith("https://") }
+> function yL(pluginId, icon){
+>   if (pluginId) { const local = f8e[pluginId]; if (local) return local }  // 仅 6 个内置插件
+>   return vL(icon) ? icon : void 0                                        // 其余一律要求 https://
+> }
+> ```
+>
+> 返回 `undefined` 时组件直接落到 `fallbackIcon`（灰色占位方块），**不报错、不打日志**。
+> `./assets/icon.png`、`assets/icon.png`、`http://…`、`data:image/png;base64,…` 全部会被拒。
+> `heroImage` 走同一个 `vL()`，规则相同。
+>
+> 只有内置的 6 个官方插件能走本地资源（客户端里硬编码了 pluginId → 打包图片的映射表 `f8e`），
+> 第三方市场没有这条路。所以**图标必须托管在一个 https 地址上**。
+>
+> 换 CDN 时只改这一行即可（`icon` 与 `assets/icon.png` 内容无关，客户端只认 URL）：
+>
+> | 方案 | URL 模板 |
+> |---|---|
+> | GitHub raw（本仓库当前用法，零第三方依赖） | `https://raw.githubusercontent.com/c80361619/zcode-toolkit/main/assets/icon.png` |
+> | jsDelivr | `https://cdn.jsdelivr.net/gh/c80361619/zcode-toolkit@main/assets/icon.png` |
+> | jsDelivr 备用域（主域不通时） | `https://gcore.jsdelivr.net/gh/c80361619/zcode-toolkit@main/assets/icon.png` |
 
 图标规格（与官方 `icon-sources.json` 的 `normalization` 约定一致）：
 
@@ -934,8 +961,9 @@ CI（`.github/workflows/ci.yml`）在 Python 3.10 / 3.12 / 3.13 上跑这套用�
 （加速 / **tokens per second**）。刻意做成大块面、高对比，缩到 16px 仍可辨认。
 
 > **注意**：`icon` 是**市场清单**字段，不写进 `.zcode-plugin/plugin.json`。
-> 客户端在解析市场清单时会显式剥离插件清单里的 `icon` / `category` / `heroImage` 等展示字段，
-> 只保留 `icon` 出现在 `marketplace.json` 的 `listing` 里才生效。
+> 客户端解析市场清单时（`createManifestFromMarketplaceEntry`）会显式 `delete` 插件清单里的
+> `icon` / `category` / `tags` / `displayName` / `heroImage` / `examplePrompts` 等展示字段，
+> **只有出现在 `marketplace.json` 的插件条目里才生效**。
 > 改完图标后需要 `plugins marketplace update <市场名>` 让缓存刷新，再重装/更新插件。
 
 ### 代码审查与修复记录
