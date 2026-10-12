@@ -422,10 +422,21 @@
     return false;
   }
 
-  function getCurrentProviderName() {
-    // 遍历 input 的 value property（React 受控输入的 value 属性不随打字更新，
-    // 原版 input[value] 属性选择器在 ZCode 表单里取不到已输入的名称）
-    for (const inp of document.querySelectorAll("input")) {
+  function getCurrentProviderName(contextEl) {
+    const container = contextEl?.closest?.('[data-model-provider-detail-scroll="true"]') ||
+                      contextEl?.closest?.('.space-y-3')?.parentElement ||
+                      document.querySelector('[data-model-provider-detail-scroll="true"]');
+    if (container) {
+      const header = container.querySelector('[data-testid="model-provider-header"]');
+      if (header) {
+        const inp = header.querySelector("input");
+        if (inp && inp.value.trim()) return inp.value.trim();
+        const textEl = header.querySelector(".text-foreground, [class*='font-semibold']");
+        if (textEl && textEl.textContent.trim()) return textEl.textContent.trim();
+      }
+    }
+    const root = container || document;
+    for (const inp of root.querySelectorAll("input")) {
       if (inp.type === "password") continue;
       const val = (inp.value || "").trim();
       if (val && !val.startsWith("http") && !val.startsWith("sk-") && !val.includes("/")) {
@@ -435,40 +446,65 @@
     return "";
   }
 
-  function getFormCredentials() {
+  function getFormCredentials(contextEl) {
     let baseUrl = "";
     let apiKey = "";
 
-    const inputs = Array.from(document.querySelectorAll("input"));
-    for (const input of inputs) {
-      const val = input.value.trim();
-      const placeholder = (input.placeholder || "").toLowerCase();
-      const testid = input.getAttribute("data-testid") || "";
+    // 严格以触发按钮为锚点向上锁定当前供应商详情容器，避免跨面板/全局 DOM 污染
+    const container = contextEl?.closest?.('[data-model-provider-detail-scroll="true"]') ||
+                      contextEl?.closest?.('.space-y-3')?.parentElement ||
+                      document.querySelector('[data-model-provider-detail-scroll="true"]') ||
+                      document;
 
-      if (
-        !apiKey &&
-        (input.type === "password" ||
-          testid.includes("Pne") ||
-          placeholder.includes("key") ||
-          placeholder.includes("sk-"))
-      ) {
-        if (val) apiKey = val;
+    // 策略 1：基于 Label 语义精准定位当前面板输入框
+    const labels = Array.from(container.querySelectorAll("label"));
+    for (const label of labels) {
+      const text = (label.textContent || "").trim().toLowerCase();
+      const formItem = label.closest("div");
+      const input = formItem?.querySelector("input") ||
+                    (label.htmlFor ? container.querySelector(`#${CSS.escape(label.htmlFor)}`) : null);
+      if (!input) continue;
+      const val = (input.value || "").trim();
+
+      if (!baseUrl && (text.includes("base url") || text.includes("端点") || text.includes("接口地址") || text === "url")) {
+        baseUrl = val;
+      } else if (!apiKey && (text.includes("api key") || text.includes("密钥") || text === "key" || text.includes("token"))) {
+        apiKey = val;
       }
+    }
 
-      if (
-        !baseUrl &&
-        input.type === "text" &&
-        (placeholder.includes("http") ||
+    // 策略 2：基于当前容器内输入框自身特征（占位符与类型）兜底
+    if (!baseUrl || !apiKey) {
+      const inputs = Array.from(container.querySelectorAll("input"));
+      for (const input of inputs) {
+        const val = (input.value || "").trim();
+        const placeholder = (input.placeholder || "").toLowerCase();
+
+        const isKeyLike = input.type === "password" ||
+                          placeholder.includes("key") ||
+                          placeholder.includes("密钥") ||
+                          placeholder.includes("sk-");
+
+        if (!apiKey && isKeyLike) {
+          if (val) apiKey = val;
+        }
+
+        const isUrlLike = !isKeyLike && (
+          placeholder.includes("example.com") ||
+          placeholder.includes("http") ||
           placeholder.includes("v1") ||
-          placeholder.includes("api") ||
-          val.startsWith("http"))
-      ) {
-        if (val) baseUrl = val;
+          val.startsWith("http")
+        );
+
+        if (!baseUrl && input.type !== "password" && isUrlLike) {
+          if (val) baseUrl = val;
+        }
       }
     }
 
     return { baseUrl, apiKey };
   }
+
 
   // 自动创建供应商时判定 kind（API 协议）：表单「API 格式」下拉 > URL 特征 > 现有供应商 > 通用默认
   // 3.11.2 实测下拉三选项：Anthropic Messages (/v1/messages) / Chat Completions (/chat/completions) / Responses (/responses)
@@ -583,7 +619,7 @@
   }
 
   // 模型选择弹窗
-  async function openModelSelectModal(models, baseUrl, apiKey, metas) {
+  async function openModelSelectModal(models, baseUrl, apiKey, metas, contextEl) {
     const existingModels = await getExistingModels(baseUrl);
 
     const stateMap = new Map();
@@ -770,13 +806,19 @@
           }
         }
 
+        // 仅在已有条目 Base URL 为空（未保存）或与当前一致时才复用名称匹配条目，
+        // 绝不因默认同名“新供应商”而将模型写错到不同 Base URL 的已有供应商上
         if (!p) {
-          const pName = getCurrentProviderName();
-          for (const [pid, pdata] of Object.entries(providers)) {
-            if (pName && pdata.name === pName) {
-              targetPid = pid;
-              p = pdata;
-              break;
+          const pName = getCurrentProviderName(contextEl);
+          if (pName) {
+            for (const [pid, pdata] of Object.entries(providers)) {
+              const exBase = normBase(pdata.options?.baseURL);
+              if (pdata.name === pName && (!exBase || exBase === cleanBase)) {
+                targetPid = pid;
+                p = pdata;
+                targets.push(pdata);
+                break;
+              }
             }
           }
         }
@@ -788,7 +830,7 @@
           const donor = customList.find(x => x.options && typeof x.options.apiKeyRequired !== "undefined");
           let host = baseUrl;
           try { host = new URL(baseUrl).host; } catch (e) {}
-          const newName = getCurrentProviderName() || host;
+          const newName = getCurrentProviderName(contextEl) || host;
           const kind =
             detectFormKind() ||
             inferKindFromUrl(baseUrl) ||
@@ -926,7 +968,7 @@
       e.preventDefault();
       e.stopPropagation();
 
-      const { baseUrl, apiKey } = getFormCredentials();
+      const { baseUrl, apiKey } = getFormCredentials(pullBtn);
       console.log("[ZCode-Model-Puller] 点击拉取，凭据:", { baseUrl, hasKey: !!apiKey });
 
       if (!baseUrl) {
@@ -981,7 +1023,7 @@
         }
 
         if (result?.success && result.models?.length > 0) {
-          await openModelSelectModal(result.models, baseUrl, apiKey, result.metas);
+          await openModelSelectModal(result.models, baseUrl, apiKey, result.metas, pullBtn);
         } else {
           showToast(`❌ 拉取失败: ${result?.error || "未获取到模型，请检查地址和 Key"}`);
         }

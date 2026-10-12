@@ -1214,7 +1214,7 @@ def _models_main_block(ipc_alias: str) -> bytes:
     bootstrap 同逻辑）。故：读时把 provider_config 合并成旧格式视图（personalModelIds
     为唯一事实源），写时同时回写 provider_config 与 config.json。"""
     h = ipc_alias
-    read_h = '''
+    read_h = r'''
 __H__.handle("zcode:read-model-config",async()=>{
 try{
 let{default:e}=await import("node:fs"),{default:t}=await import("node:path"),{default:n}=await import("node:os");
@@ -1230,8 +1230,18 @@ let legacy={};
 try{legacy=JSON.parse(e.readFileSync(t.join(root,"provider_config.json"),"utf-8"))}catch(_){}
 let rules=(legacy&&legacy.config&&legacy.config.providerConfigRules&&legacy.config.providerConfigRules.providerRules)||[];
 let kt=(y)=>/anthropic/i.test(String(y))?"anthropic":(/responses/i.test(String(y))?"openai":"openai-compatible");
-// 以 config.json 为基准「只补充、不裁剪」：保留条目上的全部字段与全部模型。
-// （旧实现用 personalModelIds 重建 models、只保留 5 个字段，写回时会静默丢配置）
+// 以 provider_config.json 的 rules 为有效准绳，过滤掉已在界面被用户删除的幽灵条目
+let validPids=new Set(rules.map(r=>r&&r.providerId).filter(Boolean));
+let validUrls=new Set(rules.map(r=>r&&r.config&&r.config.api&&r.config.api.baseUrl?String(r.config.api.baseUrl).trim().replace(/\/+$/,""):"").filter(Boolean));
+if(rules.length>0){
+for(let k0 of Object.keys(cfg.provider||{})){
+if(String(k0).startsWith("builtin:"))continue;
+let bu=String((cfg.provider[k0]&&cfg.provider[k0].options&&cfg.provider[k0].options.baseURL)||"").trim().replace(/\/+$/,"");
+if(!validPids.has(k0)&&(!bu||!validUrls.has(bu))){
+delete cfg.provider[k0];
+}
+}
+}
 for(let rule of rules){
 let pid=rule&&rule.providerId;
 if(!pid)continue;
@@ -1259,7 +1269,7 @@ if(p&&p.options&&typeof p.options=="object")delete p.options.apiKey;
 return{success:!0,data:cfg}
 }catch(e){return{success:!1,error:String(e)}}});
 '''.replace("__H__", h)
-    write_h = '''
+    write_h = r'''
 __H__.handle("zcode:write-model-config",async(e,t)=>{
 try{
 if(typeof t!="object"||t===null)throw new Error("invalid config payload");
@@ -1269,23 +1279,6 @@ try{let s=JSON.parse(n.readFileSync(r.join(base,".zcode","v2","setting.json"),"u
 if(s&&typeof s.dataBaseDir=="string"&&s.dataBaseDir.trim())base=s.dataBaseDir.trim()}catch(_){}
 let root=r.join(base,".zcode","v2");
 let o=r.join(root,"config.json");
-// 渲染层不回传 apiKey（读接口已脱敏）：条目缺 apiKey 时保留磁盘上的原值，
-// 避免"界面读不到 Key → 保存把 Key 抹掉"。
-try{
-let prev={};try{prev=JSON.parse(n.readFileSync(o,"utf-8"))}catch(_){}
-for(let pid of Object.keys(t.provider||{})){
-let np=t.provider[pid],op=prev&&prev.provider?prev.provider[pid]:null;
-if(!np||typeof np!="object")continue;
-if(!np.options||typeof np.options!="object")np.options={};
-if(!np.options.apiKey&&op&&op.options&&op.options.apiKey)np.options.apiKey=op.options.apiKey;
-}
-}catch(_){}
-// 备份只在首次创建时写：否则第二次保存会把"已改过的版本"当备份，失去回滚意义
-if(!n.existsSync(o+".puller-bak"))try{n.writeFileSync(o+".puller-bak",n.readFileSync(o,"utf-8"))}catch(a){}
-let tmpCfg=o+".tmp";
-n.writeFileSync(tmpCfg,JSON.stringify(t,null,2),"utf-8");
-n.renameSync(tmpCfg,o);
-try{
 let pcPath=r.join(root,"provider_config.json");
 let pc={};
 try{pc=JSON.parse(n.readFileSync(pcPath,"utf-8"))}catch(_){}
@@ -1299,6 +1292,34 @@ let mrules=Array.isArray(mcr.providerModelRules)?mcr.providerModelRules:(mcr.pro
 let byId={};
 for(let rule of rules){if(rule&&rule.providerId)byId[rule.providerId]=rule}
 let kt=(y)=>/anthropic/i.test(String(y))?"anthropic-messages":(/responses/i.test(String(y))?"openai-responses":"openai-chat-completions");
+
+// 渲染层不回传 apiKey（读接口已脱敏）：条目缺 apiKey 时保留磁盘上的原值；
+// 并在写 config.json 前同步剔除已在界面删除且无模型的幽灵条目，防止死条目残留
+try{
+let prev={};try{prev=JSON.parse(n.readFileSync(o,"utf-8"))}catch(_){}
+for(let pid of Object.keys(t.provider||{})){
+if(String(pid).startsWith("builtin:"))continue;
+let np=t.provider[pid],op=prev&&prev.provider?prev.provider[pid]:null;
+if(!np||typeof np!="object"){delete t.provider[pid];continue}
+if(!np.options||typeof np.options!="object")np.options={};
+if(!np.options.apiKey&&op&&op.options&&op.options.apiKey)np.options.apiKey=op.options.apiKey;
+let hasRule=!!byId[pid];
+if(!hasRule){
+let bu=String((np.options&&np.options.baseURL)||"").replace(/\/+$/,"");
+if(bu){for(let r2 of rules){let u=(r2&&r2.config&&r2.config.api&&r2.config.api.baseUrl)||"";if(u.replace(/\/+$/,"")===bu){hasRule=!0;break}}}
+}
+let mCount=Object.keys(np.models||{}).length;
+if(!hasRule&&mCount===0&&rules.length>0){delete t.provider[pid]}
+}
+}catch(_){}
+
+// 备份只在首次创建时写：否则第二次保存会把"已改过的版本"当备份，失去回滚意义
+if(!n.existsSync(o+".puller-bak"))try{n.writeFileSync(o+".puller-bak",n.readFileSync(o,"utf-8"))}catch(a){}
+let tmpCfg=o+".tmp";
+n.writeFileSync(tmpCfg,JSON.stringify(t,null,2),"utf-8");
+n.renameSync(tmpCfg,o);
+
+try{
 for(let ent0 of Object.entries(t.provider||{})){
 let pid=ent0[0],pdata=ent0[1];
 if(!pdata||typeof pdata!="object")continue;
@@ -1307,10 +1328,13 @@ let models=pdata.models||{};
 let ids=Object.keys(models);
 let rule=byId[pid];
 if(!rule){
-let bu=String((pdata.options&&pdata.options.baseURL)||"").replace(/\\/+$/,"");
+let bu=String((pdata.options&&pdata.options.baseURL)||"").replace(/\/+$/,"");
 if(bu){for(let r2 of rules){let u=(r2&&r2.config&&r2.config.api&&r2.config.api.baseUrl)||"";
-if(u.replace(/\\/+$/,"")===bu){rule=r2;break}}}}
-if(!rule){rule={providerId:pid,providerName:pdata.name||pid,config:{group:"standard-personal",access:{type:"api-key"},api:{type:kt(pdata.kind||"")},personalModelIds:[],modelOrder:[]}};rules.push(rule);byId[pid]=rule}
+if(u.replace(/\/+$/,"")===bu){rule=r2;break}}}}
+// 只有当存在有效模型（正在添加/同步）时，才为全新供应商创建 rule，严禁自动复活已删除条目
+if(!rule&&ids.length>0){rule={providerId:pid,providerName:pdata.name||pid,config:{group:"standard-personal",access:{type:"api-key"},api:{type:kt(pdata.kind||"")},personalModelIds:[],modelOrder:[]}};rules.push(rule);byId[pid]=rule}
+if(!rule)continue;
+
 let c=rule.config=rule.config||{};
 c.group=c.group||"standard-personal";
 c.access=c.access||{type:"api-key"};
