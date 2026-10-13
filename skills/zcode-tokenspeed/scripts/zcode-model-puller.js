@@ -1047,16 +1047,8 @@
     addModelBtn.after(pullBtn);
   }
 
-  // 观察器盯的是整个 body：React 每次重渲染、流式输出都会触发。原先每次变更都全量扫一遍
-  // button，开销明显；这里 250ms 防抖，配合 checkAndInject 里的「已注入」短路，常态下几乎零成本。
-  let injectTimer = null;
-  const observer = new MutationObserver(() => {
-    if (injectTimer) return;
-    injectTimer = setTimeout(() => {
-      injectTimer = null;
-      checkAndInject();
-    }, 250);
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+  // 彻底移除 document.body 的 MutationObserver，杜绝长会话挂载时的底层 C++ 监听开销。
+  // 设置页弹窗属低频偶发交互，1000ms 巡检在主聊天界面（无弹窗）时瞬间短路，零开销。
+  setInterval(checkAndInject, 1000);
   checkAndInject();
 })();

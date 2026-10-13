@@ -939,18 +939,9 @@
   }
 
   function start() {
-    setInterval(sync, 1000);
-    try {
-      let moTimer = null;
-      const mo = new MutationObserver(() => {
-        if (moTimer) clearTimeout(moTimer);
-        moTimer = setTimeout(() => {
-          moTimer = null;
-          sync();
-        }, 100);
-      });
-      mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-thought", "data-thought-levels"] });
-    } catch (err) { /* 静默 */ }
+    // 彻底移除 document.body 的 MutationObserver，消除长会话挂载时的底层 C++ 监听开销。
+    // 500ms 巡检在入口已连接且档位无变动时瞬间短路，零开销。
+    setInterval(() => { if (!document.hidden) sync(); }, 500);
     sync();
   }
   if (document.body) start();

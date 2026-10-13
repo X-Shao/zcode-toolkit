@@ -820,23 +820,9 @@
 
   function start() {
     ensureStyle();
-    let timer = null;
-    // 抖动：DOM 变动很密集（流式输出时每帧都在改），300ms 合并一次足够；
-    // 且 ensureButton() 内部只在「位置不对」时才真正写 DOM，不会引起抖动循环。
-    const schedule = () => {
-      if (timer) return;
-      timer = setTimeout(() => { timer = null; if (!document.hidden) ensureButton(); }, 300);
-    };
-    try {
-      // ★ 只监听 dock 所在的子树 + 顶层结构变化，避免被消息流每帧刷新增量拖慢；
-      //   订阅 childList 即可——按钮错位总是源于节点被移动/替换。
-      new MutationObserver(schedule).observe(document.body, {
-        childList: true, subtree: true,
-      });
-    } catch (err) { /* 静默 */ }
-    // 兜底轮询：即使 MutationObserver 漏事件（如纯 style 变更导致的 sticky 失效），
-    // 也能在一个短周期内把按钮搬回正确位置。
-    setInterval(() => { if (!document.hidden) ensureButton(); }, 1000);
+    // 彻底移除 document.body 的 MutationObserver，杜绝长会话挂载时的底层 C++ 监听负荷。
+    // 输入框属常驻组件，500ms 巡检可确保在页面视图切换后及时挂载，且在正常停留时近乎零开销。
+    setInterval(() => { if (!document.hidden) ensureButton(); }, 500);
     ensureButton();
   }
 

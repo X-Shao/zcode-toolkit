@@ -536,6 +536,12 @@
   //                   host 上 pointer-events:none 放行下方消息,胶囊本体恢复 auto
   function attach(host, mode) {
     const changed = host.getAttribute("data-ztps-mode") !== mode;
+    // 快路径：宿主已在文档树中、模式未变、且处于正确的父/兄弟节点下，无需重新查找 composer，0开销返回
+    if (!changed && host.isConnected && host._target && host._target.isConnected) {
+      if (mode === "composer-below" && host.previousElementSibling === host._target) return true;
+      if (mode === "session-top" && host.parentElement === host._target) return true;
+      if (mode === "toolbar" && host.parentElement === host._target) return true;
+    }
     if (mode === "composer-below") {
       const card = findComposerCard();
       if (!card || !card.parentElement || isInsideSidePane(card)) return false;
@@ -551,6 +557,7 @@
           pointerEvents: "auto",
         });
       }
+      host._target = card;
     } else if (mode === "session-top") {
       const sc = findSessionScroller();
       if (!sc || isInsideSidePane(sc)) return false;
@@ -566,6 +573,7 @@
           pointerEvents: "none",
         });
       }
+      host._target = sc;
     } else {
       const row = findToolbarRow();
       if (!row || isInsideSidePane(row)) return false;
@@ -583,6 +591,7 @@
         });
         row.style.alignItems = "center";
       }
+      host._target = row;
     }
     const pill = host.firstChild;
     if (pill) {
@@ -607,14 +616,17 @@
       }
 
       const visible = new Set();
-      if (mainFrame) {
-        mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
-          visible.add(el.getAttribute("data-turn-id"));
-        });
-      } else {
-        document.querySelectorAll("section[data-turn-id]").forEach((el) => {
-          if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
-        });
+      // 只有在内存中有轮次数据时才扫描可见 DOM；若 turns 为空（新启动/仅看历史），直接跳过数百个节点的 DOM 遍历
+      if (turns.size > 0) {
+        if (mainFrame) {
+          mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
+            visible.add(el.getAttribute("data-turn-id"));
+          });
+        } else {
+          document.querySelectorAll("section[data-turn-id]").forEach((el) => {
+            if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
+          });
+        }
       }
       lastVisible = visible;
       // 会话累计:轮数 / 累计输入 / 累计缓存命中 / 累计输出(仅当前可见会话的轮次)
@@ -693,7 +705,7 @@
         return;
       }
       const s = statsOf(latest);
-      // 内容签名:未变化时只做溢出复查(零 DOM 写),避免 MutationObserver 自激
+      // 内容签名:未变化时完全跳过 DOM 写入与排版回流，达到零开销
       const key = [s.stamp, s.ttft, s.tps, s.out, s.streaming,
                    agg.rounds, agg.input, agg.cache, agg.output].join("|");
       let segs = pill._zsegs;
@@ -745,22 +757,21 @@
         });
         segs.forEach((g) => g.nodes.forEach((n) => pill.appendChild(n)));
         pill._zsegs = segs;
+
+        // 仅在文本内容有变动时，才在 rAF 中执行溢出降级检查，杜绝无意义的 scrollWidth 强制回流
+        try {
+          requestAnimationFrame(() => {
+            try {
+              for (const drop of [3, 1, 2]) {
+                if (pill.scrollWidth <= pill.clientWidth + 1) break;
+                const g = segs.find((x) => x.p === drop);
+                if (!g) continue;
+                g.nodes.forEach((n) => n.remove());
+              }
+            } catch (err) { /* 静默 */ }
+          });
+        } catch (err) { /* 静默 */ }
       }
-      // 渐进降级:溢出时按优先级丢段(本轮 out → 首 token → tok/s;会话累计段保留);
-      // composer-below 与 composer 同宽空间充裕,窄窗口下才触发
-      try {
-        // 放进 rAF：读完 scrollWidth 会强制回流，别在同步渲染路径里做（避免读-写-读抖动）
-        requestAnimationFrame(() => {
-          try {
-            for (const drop of [3, 1, 2]) {
-              if (pill.scrollWidth <= pill.clientWidth + 1) break;
-              const g = segs.find((x) => x.p === drop);
-              if (!g) continue;
-              g.nodes.forEach((n) => n.remove());
-            }
-          } catch (err) { /* 静默 */ }
-        });
-      } catch (err) { /* 静默 */ }
     } catch (err) { /* 静默 */ }
   }
 
@@ -797,30 +808,24 @@
 
   function scan() {
     renderBar();
-    removeLegacyFooters();
   }
 
   function start() {
     ensureStyle();
-    // 流式估算 1s 刷新节奏；页面不可见（切到别的窗口）时直接跳过，省掉整轮 DOM 扫描
+    removeLegacyFooters();
+    // 彻底移除 document.body 的 MutationObserver，杜绝长会话挂载时的底层 C++ 监听负荷。
+    // 流式生成期间 100% 由 MessagePort 消息帧事件驱动实时刷新（0 延迟）；
+    // 会话常驻状态栏通过 500ms 轻量巡检维护（挂载状态下瞬时短路，零开销）。
     setInterval(() => {
       if (document.hidden) return;
       scheduleScan();
+    }, 500);
+    // 低频维护（5s）：清理过期轮次数据与遗留废弃节点
+    setInterval(() => {
+      if (document.hidden) return;
       prune();
-    }, 1000);
-    try {
-      let moTimer = null;
-      const mo = new MutationObserver(() => {
-        if (document.hidden) return;
-        // 防抖：React 批量挂载历史会话 DOM 期间不插队，变动平稳后统一刷新，彻底杜绝回流颠簸
-        if (moTimer) clearTimeout(moTimer);
-        moTimer = setTimeout(() => {
-          moTimer = null;
-          scheduleScan();
-        }, 80);
-      });
-      mo.observe(document.body, { childList: true, subtree: true });
-    } catch (err) { /* 静默 */ }
+      removeLegacyFooters();
+    }, 5000);
     scan();
   }
   if (document.body) start();
