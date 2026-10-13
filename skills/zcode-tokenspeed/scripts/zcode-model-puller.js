@@ -934,9 +934,13 @@
     const injected = document.getElementById("zcode-auto-pull-models-btn");
     if (injected && injected.isConnected) return;
 
-    let addModelBtn = document.querySelector('[data-testid="Goe"]');
+    // 只有存在弹窗/抽屉等容器时才检索按钮，避免在主聊天界面无脑遍历全页按钮
+    const container = document.querySelector("[role='dialog'], [data-radix-popper-content-wrapper], form");
+    if (!container) return;
+
+    let addModelBtn = container.querySelector('[data-testid="Goe"]');
     if (!addModelBtn) {
-      const btns = Array.from(document.querySelectorAll("button"));
+      const btns = Array.from(container.querySelectorAll("button"));
       addModelBtn = btns.find(
         (b) => b.textContent.includes("添加模型") && b.getAttribute("id") !== "zcode-auto-pull-models-btn"
       );
