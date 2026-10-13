@@ -1050,13 +1050,7 @@
   // 观察器盯的是整个 body：React 每次重渲染、流式输出都会触发。原先每次变更都全量扫一遍
   // button，开销明显；这里 250ms 防抖，配合 checkAndInject 里的「已注入」短路，常态下几乎零成本。
   let injectTimer = null;
-  const observer = new MutationObserver((mutations) => {
-    // 只有当变动涉及设置页弹窗/抽屉时才响应，聊天主界面变动直接忽略
-    const hasDialog = mutations.some((m) => {
-      const t = m.target;
-      return t && (t.nodeType === 1) && (t.closest?.("[role='dialog']") || t.getAttribute?.("role") === "dialog" || t.closest?.("[data-radix-popper-content-wrapper]"));
-    });
-    if (!hasDialog) return;
+  const observer = new MutationObserver(() => {
     if (injectTimer) return;
     injectTimer = setTimeout(() => {
       injectTimer = null;

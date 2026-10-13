@@ -823,19 +823,14 @@
     let timer = null;
     // 抖动：DOM 变动很密集（流式输出时每帧都在改），300ms 合并一次足够；
     // 且 ensureButton() 内部只在「位置不对」时才真正写 DOM，不会引起抖动循环。
-    const schedule = (mutations) => {
-      if (btn && btn.isConnected && !document.hidden) {
-        const relevant = (mutations || []).some((m) => {
-          const t = m.target;
-          return t && (t.nodeType === 1) && (t.closest?.("[data-testid='v4-composer']") || t.hasAttribute?.("data-composer-trailing-actions"));
-        });
-        if (!relevant) return;
-      }
+    const schedule = () => {
       if (timer) return;
       timer = setTimeout(() => { timer = null; if (!document.hidden) ensureButton(); }, 300);
     };
     try {
-      new MutationObserver((mutations) => schedule(mutations)).observe(document.body, {
+      // ★ 只监听 dock 所在的子树 + 顶层结构变化，避免被消息流每帧刷新增量拖慢；
+      //   订阅 childList 即可——按钮错位总是源于节点被移动/替换。
+      new MutationObserver(schedule).observe(document.body, {
         childList: true, subtree: true,
       });
     } catch (err) { /* 静默 */ }

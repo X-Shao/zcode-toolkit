@@ -315,24 +315,12 @@
     return null;
   };
 
-  function isTpsFrame(u8) {
-    const len = Math.min(u8.length, 160);
-    for (let k = 0; k < len - 2; k++) {
-      const b = u8[k];
-      if (b === 118 && u8[k + 1] === 101 && u8[k + 2] === 114) return true; // ver
-      if (b === 102 && u8[k + 1] === 114 && u8[k + 2] === 97) return true; // fra
-    }
-    return false;
-  }
-
   function handleFrame(data) {
     try {
       let d = data;
       if (d == null) return;
       if (d instanceof ArrayBuffer) d = new Uint8Array(d);
       if (!ArrayBuffer.isView(d)) return;
-      const u8 = new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
-      if (!isTpsFrame(u8)) return; // 极速二进制短路：非 TPS 事件帧立即跳过，避免大型数据包解码解析
       const txt = dec.decode(d);
       const i = txt.indexOf("{");
       if (i < 0) return;
@@ -619,16 +607,14 @@
       }
 
       const visible = new Set();
-      if (turns.size > 0) {
-        if (mainFrame) {
-          mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
-            visible.add(el.getAttribute("data-turn-id"));
-          });
-        } else {
-          document.querySelectorAll("section[data-turn-id]").forEach((el) => {
-            if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
-          });
-        }
+      if (mainFrame) {
+        mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
+          visible.add(el.getAttribute("data-turn-id"));
+        });
+      } else {
+        document.querySelectorAll("section[data-turn-id]").forEach((el) => {
+          if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
+        });
       }
       lastVisible = visible;
       // 会话累计:轮数 / 累计输入 / 累计缓存命中 / 累计输出(仅当前可见会话的轮次)
