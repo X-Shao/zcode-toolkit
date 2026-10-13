@@ -942,7 +942,16 @@
     setInterval(sync, 1000);
     try {
       let moTimer = null;
-      const mo = new MutationObserver(() => {
+      const mo = new MutationObserver((mutations) => {
+        // 如果滑条入口已正常挂载在 DOM 中，且没有涉及输入框或思考探针属性的变动，直接跳过
+        if (entry && entry.isConnected && !document.hidden) {
+          const relevant = mutations.some((m) => {
+            if (m.type === "attributes") return true;
+            const t = m.target;
+            return t && (t.nodeType === 1) && (t.hasAttribute?.("data-thought") || t.closest?.("[data-testid='v4-composer']"));
+          });
+          if (!relevant) return;
+        }
         if (moTimer) clearTimeout(moTimer);
         moTimer = setTimeout(() => {
           moTimer = null;
