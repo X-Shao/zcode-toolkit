@@ -941,10 +941,13 @@
   function start() {
     setInterval(sync, 1000);
     try {
-      let lastSync = 0;
+      let moTimer = null;
       const mo = new MutationObserver(() => {
-        const now = performance.now();
-        if (now - lastSync > 120) { lastSync = now; sync(); }
+        if (moTimer) clearTimeout(moTimer);
+        moTimer = setTimeout(() => {
+          moTimer = null;
+          sync();
+        }, 100);
       });
       mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-thought", "data-thought-levels"] });
     } catch (err) { /* 静默 */ }

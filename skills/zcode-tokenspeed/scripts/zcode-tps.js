@@ -416,18 +416,26 @@
             // ② 优先取处于主会话容器 [data-workspace-conversation-frame] 内的输入框
             const mainEls = els.filter(isInsideMainConversation);
             const pool = mainEls.length ? mainEls : els;
-            const vis = pool.filter((e) => e.offsetParent != null);
-            const candidates = vis.length ? vis : pool;
-            // ③ 排序准则：以最靠下为主要准则；但当纵向坐标极度接近（<20px，左右并排）时，
-            //    绝对优先选择靠左（主工作区，left 较小）的主会话输入框，彻底杜绝跳动
-            candidates.sort((a, b) => {
-              const ra = a.getBoundingClientRect();
-              const rb = b.getBoundingClientRect();
-              const dTop = rb.top - ra.top;
-              if (Math.abs(dTop) > 20) return dTop;
-              return ra.left - rb.left;
-            });
-            hit = candidates[0];
+            if (pool.length === 1) {
+              hit = pool[0];
+            } else {
+              const vis = pool.filter((e) => e.offsetParent != null);
+              const candidates = vis.length ? vis : pool;
+              if (candidates.length === 1) {
+                hit = candidates[0];
+              } else {
+                // ③ 排序准则：以最靠下为主要准则；但当纵向坐标极度接近（<20px，左右并排）时，
+                //    绝对优先选择靠左（主工作区，left 较小）的主会话输入框，彻底杜绝跳动
+                candidates.sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  const dTop = rb.top - ra.top;
+                  if (Math.abs(dTop) > 20) return dTop;
+                  return ra.left - rb.left;
+                });
+                hit = candidates[0];
+              }
+            }
           }
         }
       } catch (err) { /* 选择器不合法，跳过 */ }
@@ -579,20 +587,36 @@
     try {
       const mode = getPos();
       // 只认当前主会话 DOM 里可见的轮次——排除侧边栏辅助对话的轮次干扰
+      const mainFrame = document.querySelector("[data-workspace-conversation-frame]");
       let domSess = null;
-      const sessNodes = Array.from(document.querySelectorAll("[data-session-id]")).filter((el) => !isInsideSidePane(el));
-      for (const el of sessNodes) {
-        if (!domSess && el.offsetParent != null) domSess = el.getAttribute("data-session-id");
+      if (mainFrame) {
+        domSess = mainFrame.getAttribute("data-session-id");
+        if (!domSess) {
+          const innerSess = mainFrame.querySelector("[data-session-id]");
+          if (innerSess) domSess = innerSess.getAttribute("data-session-id");
+        }
       }
-      if (!domSess && sessNodes.length) {
-        domSess = sessNodes[0].getAttribute("data-session-id");
+      if (!domSess) {
+        const sessNodes = Array.from(document.querySelectorAll("[data-session-id]")).filter((el) => !isInsideSidePane(el));
+        if (sessNodes.length === 1) {
+          domSess = sessNodes[0].getAttribute("data-session-id");
+        } else {
+          for (const el of sessNodes) {
+            if (!domSess && el.offsetParent != null) domSess = el.getAttribute("data-session-id");
+          }
+          if (!domSess && sessNodes.length) domSess = sessNodes[0].getAttribute("data-session-id");
+        }
       }
       const visible = new Set();
-      const mainFrame = document.querySelector("[data-workspace-conversation-frame]");
-      const turnScope = mainFrame || document;
-      turnScope.querySelectorAll("section[data-turn-id]").forEach((el) => {
-        if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
-      });
+      if (mainFrame) {
+        mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
+          visible.add(el.getAttribute("data-turn-id"));
+        });
+      } else {
+        document.querySelectorAll("section[data-turn-id]").forEach((el) => {
+          if (!isInsideSidePane(el)) visible.add(el.getAttribute("data-turn-id"));
+        });
+      }
       lastVisible = visible;
       // 会话累计:轮数 / 累计输入 / 累计缓存命中 / 累计输出(仅当前可见会话的轮次)
       const agg = { rounds: 0, input: 0, cache: 0, output: 0 };
@@ -786,14 +810,15 @@
       prune();
     }, 1000);
     try {
-      let lastSync = 0;
+      let moTimer = null;
       const mo = new MutationObserver(() => {
         if (document.hidden) return;
-        // DOM 一变立即同步刷新，切换会话零残留；16ms 节流防回放风暴
-        const now = performance.now();
-        if (now - lastSync > 16) { lastSync = now; renderBar(); }
-        clearTimeout(mo._t);
-        mo._t = setTimeout(scan, 60);
+        // 防抖：React 批量挂载历史会话 DOM 期间不插队，变动平稳后统一刷新，彻底杜绝回流颠簸
+        if (moTimer) clearTimeout(moTimer);
+        moTimer = setTimeout(() => {
+          moTimer = null;
+          scan();
+        }, 80);
       });
       mo.observe(document.body, { childList: true, subtree: true });
     } catch (err) { /* 静默 */ }
