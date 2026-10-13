@@ -220,6 +220,15 @@
     while (t.win.length > 2 && t.win[0][0] < floor) t.win.shift();
   };
 
+  let scanRaf = 0;
+  function scheduleScan() {
+    if (scanRaf) return;
+    scanRaf = requestAnimationFrame(() => {
+      scanRaf = 0;
+      scan();
+    });
+  }
+
   function onRow(row) {
     if (!row) return;
     if (row.op === "row.delta") { onRowDelta(row); return; }
@@ -233,13 +242,13 @@
       t.activeMs = row.activeMs ?? t.activeMs;
       t.streaming = row.state != null && !/^(completedSuccess|completed|failed|stopped|cancelled)/.test(row.state);
       if (row.sourceCommandId) t.sourceCommandId = row.sourceCommandId;
-      scan();
+      scheduleScan();
     } else if (row.kind === "userInput") {
       if ((t.endedAt != null || t.lastUsageAt != null) && row.createdAt && row.createdAt !== t.startedAt) resetTurnStats(t);
       t.startedAt = row.createdAt ?? t.startedAt;
       t.streaming = true;
       if (row.sourceCommandId) t.sourceCommandId = row.sourceCommandId;
-      scan();
+      scheduleScan();
     } else if (row.kind === "reasoning" || row.kind === "assistantText") {
       if (row.assistantResponseId) respTurn.set(row.assistantResponseId, row.turnId);
       if (row.text && row.text.length) t.textTok = estTok(row.text);   // 全量覆盖，防增量累计漂移
@@ -279,7 +288,7 @@
       if (t.firstChunkAt == null && firstChunkByScid[scid] != null) {
         t.firstChunkAt = firstChunkByScid[scid];
       }
-      scan();
+      scheduleScan();
     } else if (ev.kind === "stream.chunk") {
       if (firstChunkByScid[scid] == null) firstChunkByScid[scid] = ev.occurredAt;
       let t = findByScid(scid);
@@ -596,17 +605,7 @@
           if (innerSess) domSess = innerSess.getAttribute("data-session-id");
         }
       }
-      if (!domSess) {
-        const sessNodes = Array.from(document.querySelectorAll("[data-session-id]")).filter((el) => !isInsideSidePane(el));
-        if (sessNodes.length === 1) {
-          domSess = sessNodes[0].getAttribute("data-session-id");
-        } else {
-          for (const el of sessNodes) {
-            if (!domSess && el.offsetParent != null) domSess = el.getAttribute("data-session-id");
-          }
-          if (!domSess && sessNodes.length) domSess = sessNodes[0].getAttribute("data-session-id");
-        }
-      }
+
       const visible = new Set();
       if (mainFrame) {
         mainFrame.querySelectorAll("section[data-turn-id]").forEach((el) => {
@@ -806,7 +805,7 @@
     // 流式估算 1s 刷新节奏；页面不可见（切到别的窗口）时直接跳过，省掉整轮 DOM 扫描
     setInterval(() => {
       if (document.hidden) return;
-      scan();
+      scheduleScan();
       prune();
     }, 1000);
     try {
@@ -817,7 +816,7 @@
         if (moTimer) clearTimeout(moTimer);
         moTimer = setTimeout(() => {
           moTimer = null;
-          scan();
+          scheduleScan();
         }, 80);
       });
       mo.observe(document.body, { childList: true, subtree: true });
