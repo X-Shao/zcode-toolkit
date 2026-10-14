@@ -203,7 +203,7 @@
   // ---------- 状态探针 ----------
   function probe() {
     let el = null;
-    try { el = document.querySelector("[data-thought][data-thought-levels]"); } catch (err) { /* ignore */ }
+    try { el = document.querySelector("[data-testid='v4-model-config'], [data-thought][data-thought-levels]"); } catch (err) { /* ignore */ }
     if (!el) return null;
     const levels = (el.getAttribute("data-thought-levels") || "")
       .split(",").map((s) => s.trim()).filter(Boolean);
@@ -236,7 +236,7 @@
   // 原生触发器 BUTTON:jU 子树里的第一个 button(单档位固定徽章分支无 BUTTON,返回 null)
   function anchorTrigger() {
     try {
-      const span = document.querySelector("[data-thought][data-thought-levels]");
+      const span = document.querySelector("[data-testid='v4-model-config'], [data-thought][data-thought-levels]");
       if (!span || !span.parentElement) return null;
       const ju = findThoughtFiber(span.parentElement);
       if (!ju) return null;

@@ -48,16 +48,16 @@ python "<skill目录>/scripts/doctor.py" --where  # 只查「插件装在哪」+
 
 补丁会随 ZCode 升级失效或过时，先确认目标版本，再决定打哪个：
 
-| 补丁 | 3.11.2 及更早 | 3.14.x（实测 3.14.1 / 3.14.3） |
+| 补丁 | 3.11.2 及更早 | 3.14.x ~ 3.15.x（实测 3.14.1 / 3.14.3 / 3.15.1） |
 |---|---|---|
 | ① 思考档位透传（内核补丁） | 需要，走 `providerOptionsByLevel` 兜底 | **已过时**：内核机制整体重写（`providerOptionsByLevel` 只剩 schema 定义，`variants/defaultVariant` 已从内核消失），锚点与结构提取都失效。脚本会提示「原生档位机制，本补丁不适用」 |
-| ①′ 档位配置 `--reasoning-config` | 不需要（用 ①） | **需要**：把档位写进 `provider_config.json` 的 `providerModelRules[].config.optionSpecs.reasoningLevel`（`values` = 界面档位、末位即默认；`map` = CEL，内核发请求前求值并合并进请求体）。无需内核补丁 |
-| ② 用量页去截断 | 需要 | 需要 |
+| ①′ 档位配置 `--reasoning-config` | 不需要（用 ①） | **需要**：把档位写进 `provider_config.json` 的 `providerModelRules[].config.optionSpecs.reasoningLevel`（`values` = 界面档位、末位即默认；`map` = CEL，内核发请求前求值并合并进请求体；支持 `maxOutputTokens`）。无需内核补丁 |
+| ② 用量页去截断 | 需要 | 需要（已支持弹性正则动态匹配，抗混淆变量漂移） |
 | ③ 模型弹窗加宽 | 两处锚点 | 需要，但只剩**扁平弹窗**一处（渠道子菜单上游已改为自适应宽度 `w-max min-w-48`，脚本识别后报「无需补丁」） |
-| ④ TPS 状态栏 | 需要 | 需要 |
-| ⑤ 模型拉取按钮 | 需要 | 需要，模板已按 `optionSpecs` 新格式写入 |
-| ⑥ 思考强度滑条 | 需要 | 需要 |
-| ⑦ 增强提示词 | —（新功能） | 需要：按钮经 preload 桥 / main handler 用**选定**的模型调一次补全；提示词模板内置。0.5.9 起解析只选**真正可用**的供应商，并对失败做归因与分类重试；0.6.7 起支持**右键选模型**（菜单按供应商分组、选中即持久化、零重启生效，见第七节） |
+| ④ TPS 状态栏 | 需要 | 需要（支持原生思考 Token 统计、耗时精准校准与双态按钮常驻追踪） |
+| ⑤ 模型拉取按钮 | 需要 | 需要，优先对齐官方 `model-provider-add-model-button` 契约，模板按 `optionSpecs` 新格式写入 |
+| ⑥ 思考强度滑条 | 需要 | 需要（优先对接官方 `v4-model-config` 契约锚点） |
+| ⑦ 增强提示词 | —（新功能） | 需要：优先对接官方 `v4-model-config` 契约锚点；支持右键按供应商自选模型，持久化且免重启 |
 
 > **升级会整体覆盖 app.asar**：除 ①（配置侧，写 `provider_config.json`）外，②–⑦ 升级后都需重跑。
 > 其中**重打包级**（④ TPS 状态栏 / ⑤ 模型拉取按钮 / ⑥ 思考强度滑条 / ⑦ 增强提示词）重跑时会按内容比对

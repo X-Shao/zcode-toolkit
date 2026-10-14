@@ -934,16 +934,21 @@
     const injected = document.getElementById("zcode-auto-pull-models-btn");
     if (injected && injected.isConnected) return;
 
-    // 只有存在弹窗/抽屉等容器时才检索按钮，避免在主聊天界面无脑遍历全页按钮
-    const container = document.querySelector("[role='dialog'], [data-radix-popper-content-wrapper], form");
-    if (!container) return;
+    // 1. 优先使用官方 E2E 规范契约 testid 与历史混淆锚点秒查（单次属性查询微秒级，在聊天主界面瞬间短路）
+    let addModelBtn = document.querySelector('[data-testid="model-provider-add-model-button"]') ||
+                      document.querySelector('[data-testid="Goe"]');
 
-    let addModelBtn = container.querySelector('[data-testid="Goe"]');
+    // 2. 文本兜底：仅当未命中 testid 且存在供应商详情/抽屉容器时才遍历按钮（杜绝聊天主界面全量扫按钮）
     if (!addModelBtn) {
-      const btns = Array.from(container.querySelectorAll("button"));
-      addModelBtn = btns.find(
-        (b) => b.textContent.includes("添加模型") && b.getAttribute("id") !== "zcode-auto-pull-models-btn"
+      const container = document.querySelector(
+        '[data-model-provider-detail-scroll="true"], [data-model-provider-split-panel="true"], [role="dialog"]'
       );
+      if (container) {
+        const btns = Array.from(container.querySelectorAll("button"));
+        addModelBtn = btns.find(
+          (b) => b.textContent.includes("添加模型") && b.getAttribute("id") !== "zcode-auto-pull-models-btn"
+        );
+      }
     }
 
     if (!addModelBtn) return;

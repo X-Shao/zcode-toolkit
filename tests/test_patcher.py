@@ -676,6 +676,9 @@ class TestReasoningConfig(TempCase):
         self.assertEqual(rl["values"], ["low", "max", "high"])
         self.assertIn("reasoning_effort", rl["map"])
         self.assertIn("contextWindow", self.rule("m-variants")["config"]["properties"])
+        mot = self.rule("m-variants")["config"]["optionSpecs"]["maxOutputTokens"]
+        self.assertEqual(mot["max"], 32000)
+        self.assertIn("maxOutputTokens", mot["map"])
 
     def test_new_rule_gets_context_window(self):
         """config.json 里存在但 providerModelRules 缺失的模型要新建规则（含 contextWindow）。"""

@@ -685,12 +685,16 @@ USAGE_PATCHES = [
         "key": "AppUsageDailyModelTrendChart",
         "pattern": b"n.models.slice(0,6)",
         "replacement": b"n.models",
+        "regex": rb"([a-zA-Z_$][a-zA-Z0-9_$]*)\.models\.slice\(0,\s*6\)",
+        "regex_replacement": lambda m: m.group(1) + b".models",
         "desc": "每日趋势图：去掉 Top6 截断，全部模型出线",
     },
     {
         "key": "AppUsageModelUsagePieChart",
         "pattern": b"i=n.length>Q,a=i?Q-1:Q",
         "replacement": b"i=!1,a=1/0",
+        "regex": rb"([a-zA-Z_$][a-zA-Z0-9_$]*)=([a-zA-Z_$][a-zA-Z0-9_$]*)\.length>([a-zA-Z_$][a-zA-Z0-9_$]*),([a-zA-Z_$][a-zA-Z0-9_$]*)=\1\?\3-1:\3",
+        "regex_replacement": lambda m: m.group(1) + b"=!1," + m.group(4) + b"=1/0",
         "desc": "模型用量饼图：去掉 Top5+其他模型 合并，全部模型出块",
     },
 ]
@@ -864,22 +868,29 @@ def process_usage_chart(asar: Path, check_only: bool, revert: bool, *,
             with open(asar, "r+b") as f:
                 f.seek(off)
                 raw = f.read(size)
-            if item["pattern"] not in raw:
+            pat = item["pattern"]
+            rep = item["replacement"]
+            if pat not in raw and "regex" in item:
+                m = re.search(item["regex"], raw)
+                if m:
+                    pat = m.group(0)
+                    rep = item["regex_replacement"](m)
+            if pat not in raw:
                 print(f"    [=] {fname} | 已打（{item['desc']}）")
                 if not check_only:
                     _asar_sync_integrity(asar, path, raw, dry_run=dry_run)
                 continue
-            cnt = raw.count(item["pattern"])
+            cnt = raw.count(pat)
             if cnt != 1:
                 print(f"    [!] {fname} | 截断表达式出现 {cnt} 次（期望 1），拒绝盲改")
                 continue
             if check_only:
                 print(f"    [ ] {fname} | 未打（{item['desc']}）")
                 continue
-            new = raw.replace(item["pattern"], item["replacement"], 1)
+            new = raw.replace(pat, rep, 1)
             padded = new + b" " * (len(raw) - len(new))   # 同长度原地覆盖，asar 头零改动
             if dry_run:
-                print(f"    [~] {fname} | 将替换 {item['pattern'].decode()}（{item['desc']}）")
+                print(f"    [~] {fname} | 将替换 {pat.decode()}（{item['desc']}）")
                 changed = True
                 continue
             if not any(r.get("offset") == off for r in saved):
@@ -2676,16 +2687,33 @@ def process_reasoning_config(v2_root: Path, check_only: bool, revert: bool, *,
                 conflicts.append(f"{pid}/{mid}")
                 continue
             map_expr = REASONING_MAP_ANTHROPIC if kind == "anthropic" else REASONING_MAP_OPENAI
+            ctx = ((entry.get("limit") or {}).get("context")) or 1000000
+            max_tok = (
+                ((entry.get("limit") or {}).get("maxTokens")) or
+                ((entry.get("limit") or {}).get("output")) or
+                (((entry.get("optionSpecs") or {}).get("maxOutputTokens") or {}).get("max"))
+            )
+            try:
+                max_tok = int(max_tok) if max_tok and int(max_tok) > 0 else None
+            except (ValueError, TypeError):
+                max_tok = None
+
             rule = by_key.get((pid, mid))
-            rl = None
-            if rule:
-                rl = ((rule.get("config") or {}).get("optionSpecs") or {}).get("reasoningLevel")
-            if isinstance(rl, dict) and rl.get("values") == levels and rl.get("map") == map_expr:
+            specs_existing = ((rule.get("config") or {}).get("optionSpecs") or {}) if rule else {}
+            rl = specs_existing.get("reasoningLevel")
+            rl_match = isinstance(rl, dict) and rl.get("values") == levels and rl.get("map") == map_expr
+            mot = specs_existing.get("maxOutputTokens")
+            mot_match = True
+            if max_tok is not None:
+                mot_match = isinstance(mot, dict) and mot.get("max") == max_tok
+
+            if rl_match and mot_match:
                 unchanged.append(f"{pid}/{mid}")
                 continue
-            ctx = ((entry.get("limit") or {}).get("context")) or 1000000
+
             planned.append({"pid": pid, "mid": mid, "kind": kind, "levels": levels,
-                            "map": map_expr, "src": src, "ctx": int(ctx), "existed": bool(rule)})
+                            "map": map_expr, "src": src, "ctx": int(ctx), "max_tok": max_tok,
+                            "existed": bool(rule)})
 
     for it in planned:
         print(f"    {'[ ]' if check_only else '[~]'} {it['pid']}/{it['mid']}"
@@ -2738,6 +2766,14 @@ def process_reasoning_config(v2_root: Path, check_only: bool, revert: bool, *,
         if not isinstance(specs, dict):
             specs = c["optionSpecs"] = {}
         specs["reasoningLevel"] = {"values": it["levels"], "map": it["map"]}
+        if it.get("max_tok"):
+            if "maxOutputTokens" in specs and isinstance(specs["maxOutputTokens"], dict):
+                specs["maxOutputTokens"]["max"] = it["max_tok"]
+            else:
+                specs["maxOutputTokens"] = {
+                    "max": it["max_tok"],
+                    "map": '{"max_tokens": maxOutputTokens}',
+                }
 
     tmp = pc_path.with_name(pc_path.name + ".tmp")
     try:

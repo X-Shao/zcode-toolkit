@@ -177,6 +177,10 @@
         "@media (prefers-color-scheme: dark){",
         ":root:not(.light):not([data-theme='light']) [data-ztps-menu]",
         "{--ztps-bg:#1e1e1e;--ztps-fg:#e8e8e8}}",
+        "/* 模型弹窗扁平列表宽度自适应保障 */",
+        "[data-radix-popper-content-wrapper] [role='menu'].w-48,",
+        "[data-radix-popper-content-wrapper] [role='listbox'].w-48,",
+        "[data-radix-popper-content-wrapper] .w-48.max-h-72{width:20rem!important;min-width:20rem!important}",
       ].join("");
       document.head.appendChild(st);
     } catch (err) { /* 静默 */ }
@@ -191,9 +195,9 @@
   const get = (id) => {
     if (!turns.has(id)) turns.set(id, {
       msgId: id, sourceCommandId: null, sessionId: null,
-      startedAt: null, endedAt: null, activeMs: null,
+      startedAt: null, endedAt: null, activeMs: null, modelDurationMs: null,
       firstChunkAt: null, rowFirstAt: null, lastUsageAt: null,
-      outputTokens: 0, inputTokens: 0, cacheReadTokens: 0, totalTokens: 0,
+      outputTokens: 0, inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 0,
       textTok: 0, win: [], modelId: null, streaming: false,
     });
     return turns.get(id);
@@ -201,9 +205,9 @@
 
   // 轮复用（编辑重发/重试复用同一 turnId）时清空上一轮统计，避免旧值残留到新轮
   function resetTurnStats(t) {
-    t.endedAt = null; t.activeMs = null;
+    t.endedAt = null; t.activeMs = null; t.modelDurationMs = null;
     t.firstChunkAt = null; t.rowFirstAt = null; t.lastUsageAt = null;
-    t.outputTokens = 0; t.inputTokens = 0; t.cacheReadTokens = 0; t.totalTokens = 0;
+    t.outputTokens = 0; t.inputTokens = 0; t.cacheReadTokens = 0; t.cacheWriteTokens = 0; t.reasoningTokens = 0; t.totalTokens = 0;
     t.textTok = 0; t.win = []; t.lastTps = null; t.streaming = true;
   }
 
@@ -240,6 +244,7 @@
       t.startedAt = row.startedAt ?? t.startedAt;
       t.endedAt = row.endedAt ?? t.endedAt;
       t.activeMs = row.activeMs ?? t.activeMs;
+      t.modelDurationMs = row.modelDurationMs ?? t.modelDurationMs;
       t.streaming = row.state != null && !/^(completedSuccess|completed|failed|stopped|cancelled)/.test(row.state);
       if (row.sourceCommandId) t.sourceCommandId = row.sourceCommandId;
       scheduleScan();
@@ -278,6 +283,8 @@
       t.outputTokens += ev.outputTokens || 0;
       t.inputTokens += ev.inputTokens || 0;
       t.cacheReadTokens += ev.cacheReadTokens || 0;
+      t.cacheWriteTokens += ev.cacheWriteTokens || 0;
+      t.reasoningTokens += ev.reasoningTokens || 0;
       t.totalTokens += ev.totalTokens || 0;
       t.modelId = ev.modelId || t.modelId;
       if (t.modelId && typeof window !== "undefined") {
@@ -370,6 +377,7 @@
     const ttft = firstAt != null && t.startedAt != null ? firstAt - t.startedAt : null;
     let out = t.outputTokens;
     if (out === 0 && t.textTok > 0) out = t.textTok;   // 中止/失败未报 usage：以内容估算兜底
+    const reasoning = t.reasoningTokens || 0;
     let tps = null;
     if (t.streaming) {
       out = Math.max(out, t.textTok);   // 流式中 usage 未到，用内容估算补齐（精确值到达后自然切换）
@@ -382,14 +390,19 @@
       }
       if (tps == null && t.lastTps != null) tps = t.lastTps;   // 工具执行等静默期：保持最近速度
     } else {
-      const decodeFrom = firstAt ?? t.startedAt;
-      const decodeMs = decodeFrom != null && t.lastUsageAt != null ? t.lastUsageAt - decodeFrom : null;
-      tps = t.outputTokens > 0 && decodeMs > 500 ? t.outputTokens / (decodeMs / 1000) : null;
+      // 优先使用官方下发的精确 modelDurationMs 校准全轮纯模型生成速率
+      if (t.modelDurationMs != null && t.modelDurationMs > 500 && t.outputTokens > 0) {
+        tps = t.outputTokens / (t.modelDurationMs / 1000);
+      } else {
+        const decodeFrom = firstAt ?? t.startedAt;
+        const decodeMs = decodeFrom != null && t.lastUsageAt != null ? t.lastUsageAt - decodeFrom : null;
+        tps = t.outputTokens > 0 && decodeMs > 500 ? t.outputTokens / (decodeMs / 1000) : null;
+      }
       if (tps == null && t.lastTps != null) tps = t.lastTps;
     }
     if (tps != null) t.lastTps = tps;
     return {
-      stamp: fmtStamp(t.endedAt || t.startedAt), ttft, tps, out,
+      stamp: fmtStamp(t.endedAt || t.startedAt), ttft, tps, out, reasoning,
       streaming: t.streaming,
     };
   }
@@ -487,14 +500,11 @@
       return null;
     };
 
-    // ① 首选：发送按钮向上找工具栏行。
-    //    发送按钮（v4-composer-send）恒在工具栏内，且不会与输入框的 testid 混淆——
-    //    注意不能用输入框的 closest("[data-testid*='composer']")：输入框自身 testid
-    //    也含 "composer"，closest 从自身起匹配会返回输入框本身（3.12.2 实测踩到）。
+    // ① 首选：发送/停止按钮向上找工具栏行（生成中发送按钮会被官方切换为停止按钮 v4-stop）。
     let picked = null;
     try {
-      const sendBtn = document.querySelector("[data-testid='v4-composer-send']");
-      if (sendBtn && card.contains(sendBtn)) picked = rowFrom(sendBtn, card);
+      const btn = card.querySelector("[data-testid='v4-composer-send'], [data-testid='v4-stop']");
+      if (btn) picked = rowFrom(btn, card);
     } catch (err) { /* ignore */ }
 
     // ② 回退：card 内所有 items-end 行，取含交互控件的那一行（或最后一个）
@@ -629,8 +639,8 @@
         }
       }
       lastVisible = visible;
-      // 会话累计:轮数 / 累计输入 / 累计缓存命中 / 累计输出(仅当前可见会话的轮次)
-      const agg = { rounds: 0, input: 0, cache: 0, output: 0 };
+      // 会话累计:轮数 / 累计输入 / 累计缓存命中 / 累计思考 / 累计输出(仅当前可见会话的轮次)
+      const agg = { rounds: 0, input: 0, cache: 0, cacheWrite: 0, reasoning: 0, output: 0 };
       let latest = null;
       for (const t of turns.values()) {
         if (!visible.has(t.msgId)) continue;
@@ -639,6 +649,8 @@
         if (t.startedAt != null || hasActivity(t)) agg.rounds++;
         agg.input += t.inputTokens || 0;
         agg.cache += t.cacheReadTokens || 0;
+        agg.cacheWrite += t.cacheWriteTokens || 0;
+        agg.reasoning += t.reasoningTokens || 0;
         // 流式中 usage 未到的轮以内容估算兜底,精确值到达后自然覆盖
         agg.output += Math.max(t.outputTokens || 0, t.streaming ? (t.textTok || 0) : 0);
         if (!latest || (t.startedAt ?? 0) > (latest.startedAt ?? 0)) latest = t;
@@ -655,6 +667,7 @@
             msgId: latest.msgId, sessionId: latest.sessionId,
             startedAt: latest.startedAt, endedAt: latest.endedAt,
             streaming: latest.streaming, out: latest.outputTokens, textTok: latest.textTok,
+            reasoning: latest.reasoningTokens,
           };
         }
         diag.hostAttached = !!host;
@@ -706,8 +719,8 @@
       }
       const s = statsOf(latest);
       // 内容签名:未变化时完全跳过 DOM 写入与排版回流，达到零开销
-      const key = [s.stamp, s.ttft, s.tps, s.out, s.streaming,
-                   agg.rounds, agg.input, agg.cache, agg.output].join("|");
+      const key = [s.stamp, s.ttft, s.tps, s.out, s.reasoning, s.streaming,
+                   agg.rounds, agg.input, agg.cache, agg.cacheWrite, agg.reasoning, agg.output].join("|");
       let segs = pill._zsegs;
       if (pill._zkey !== key) {
         pill._zkey = key;
@@ -729,11 +742,12 @@
         dot.style.color = "#4ade80";
         if (s.streaming) dot.style.textShadow = "0 0 6px rgba(74,222,128,.8)";
         pill.appendChild(dot);
-        // 段布局:本轮即时指标(g0:首 token/tok/s)+ 会话累计(g1:轮/总用/输入/命中+命中率/累出)。
+        // 段布局:本轮即时指标(g0:首 token/tok/s/思考)+ 会话累计(g1:轮/总用/输入/命中+命中率/累思/累出)。
         // 组间用竖线分隔,组内用 · ;不显示时间(用户不需要)
         segs = [];
         if (s.ttft != null && s.ttft >= 0) segs.push({ p: 1, g: 0, nodes: [span("首 token "), span(fmtLat(s.ttft), "VALUE")] });
         if (s.tps != null) segs.push({ p: 2, g: 0, nodes: [span(fmtTps(s.tps) + " tok/s", "ACCENT")] });
+        if (s.reasoning > 0) segs.push({ p: 2.5, g: 0, nodes: [span("思考 "), span(fmtTok(s.reasoning), "ACCENT")] });
         if (agg.rounds > 0) segs.push({ p: 4, g: 1, nodes: [span("第 " + agg.rounds + " 轮")] });
         const totalTok = (agg.input || 0) + (agg.output || 0);
         if (totalTok > 0) segs.push({ p: 3, g: 1, nodes: [span("总用 "), span(fmtTok(totalTok), "VALUE")] });
@@ -745,6 +759,9 @@
             if (pct > 0) nodes.push(span(" 平均命中 " + fmtPct(pct) + "%", "ACCENT"));
           }
           segs.push({ p: 5, g: 1, nodes });
+        }
+        if (agg.reasoning > 0 && !(s.reasoning > 0)) {
+          segs.push({ p: 5.5, g: 1, nodes: [span("累思 "), span(fmtTok(agg.reasoning), "VALUE")] });
         }
         if (agg.output > 0) segs.push({ p: 6, g: 1, nodes: [span("累出 "), span(fmtTok(agg.output), "VALUE")] });
         segs.forEach((g, i) => {

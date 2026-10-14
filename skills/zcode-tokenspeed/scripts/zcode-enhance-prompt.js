@@ -516,10 +516,21 @@
   function currentModel() {
     let value = "", label = "";
     try {
+      // ⓪ 首选：官方契约探针 [data-testid="v4-model-config"] 原生挂载了 data-provider 与 data-model
+      const probe = document.querySelector("[data-testid='v4-model-config']");
+      if (probe && !isInsideSidePane(probe)) {
+        const p = (probe.getAttribute("data-provider") || "").trim();
+        const m = (probe.getAttribute("data-model") || "").trim();
+        if (p && m) {
+          value = p + "/" + m;
+          label = m;
+        }
+      }
+
       const dock = findDock();
       let pool = [];
-      if (dock) pool = Array.from(dock.querySelectorAll("[data-model-current-value]"));
-      if (!pool.length) {
+      if (!value && dock) pool = Array.from(dock.querySelectorAll("[data-model-current-value]"));
+      if (!value && !pool.length) {
         // dock 内没有（生成态/极端布局）才退回全局，但严格排除侧边栏，且优先主工作区
         pool = Array.from(document.querySelectorAll("[data-model-current-value]"))
           .filter((e) => !isInsideSidePane(e) && !e.closest("[data-testid='workflow-run-settings-model']"));
